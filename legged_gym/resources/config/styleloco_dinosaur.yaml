@@ -1,0 +1,11 @@
+motions:
+  loco:
+    - file: ../dataset/dataset_styleloco/Dinosaur_BW.pt
+      rsi_skipped_range: []
+      weight: 1.0
+    - file: ../dataset/dataset_styleloco/Dinosaur_FW.pt
+      rsi_skipped_range: []
+      weight: 1.0
+    - file: ../dataset/dataset_styleloco/Dinosaur_SW.pt
+      rsi_skipped_range: []
+      weight: 1.0

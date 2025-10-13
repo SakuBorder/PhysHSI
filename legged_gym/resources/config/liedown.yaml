@@ -1,0 +1,55 @@
+motions:
+  lieDown:
+    - file: ../dataset/dataset_liedown/lieDown/SAMP+__+Subject+__+lie_down_8_stageII.pt
+      rsi_skipped_range: [320, 10000]
+      weight: 2.0
+    - file: ../dataset/dataset_liedown/lieDown/SAMP+__+Subject+__+lie_down_10_stageII.pt
+      rsi_skipped_range: [290, 10000]
+      weight: 2.0
+    - file: ../dataset/dataset_liedown/lieDown/SAMP+__+Subject+__+lie_down_17_stageII.pt
+      rsi_skipped_range: [430, 10000]
+      weight: 2.0
+    - file: ../dataset/dataset_liedown/lieDown/SAMP+__+Subject+__+lie_down_28_stageII.pt
+      rsi_skipped_range: [240, 10000]
+      weight: 2.0
+    - file: ../dataset/dataset_liedown/lieDown/SAMP+__+Subject+__+lie_down_21_stageII.pt
+      rsi_skipped_range: [520, 10000]
+      weight: 2.0
+    - file: ../dataset/dataset_liedown/lieDown/SAMP+__+Subject+__+lie_down_18_stageII.pt
+      rsi_skipped_range: []
+      weight: 2.0
+
+  loco:
+    - file: ../dataset/dataset_liedown/loco_direction/B1_-_stand_to_walk_stageii.pt
+      rsi_skipped_range: []
+      weight: 1.0
+    - file: ../dataset/dataset_liedown/loco_direction/B2_-_walk_to_stand_stageii.pt
+      rsi_skipped_range: []
+      weight: 1.0
+    - file: ../dataset/dataset_liedown/loco_direction/B2_-_walk_to_stand_t2_stageii.pt
+      rsi_skipped_range: []
+      weight: 1.0
+    - file: ../dataset/dataset_liedown/loco_direction/B3_-_walk1_stageii.pt
+      rsi_skipped_range: []
+      weight: 1.0
+    - file: ../dataset/dataset_liedown/loco_direction/B9_-_walk_turn_left_(90)_stageii.pt
+      rsi_skipped_range: []
+      weight: 1.0
+    - file: ../dataset/dataset_liedown/loco_direction/B10_-_walk_turn_left_(45)_stageii.pt
+      rsi_skipped_range: []
+      weight: 1.0
+    - file: ../dataset/dataset_liedown/loco_direction/B11_-_walk_turn_left_(135)_stageii.pt
+      rsi_skipped_range: []
+      weight: 1.0
+    - file: ../dataset/dataset_liedown/loco_direction/B12_-_walk_turn_right_(90)_stageii.pt
+      rsi_skipped_range: []
+      weight: 1.0
+    - file: ../dataset/dataset_liedown/loco_direction/B13_-_walk_turn_right_(45)_stageii.pt
+      rsi_skipped_range: []
+      weight: 1.0
+    - file: ../dataset/dataset_liedown/loco_direction/B14_-_walk_turn_right_(135)_stageii.pt
+      rsi_skipped_range: []
+      weight: 1.0
+    - file: ../dataset/dataset_liedown/loco_direction/B15_-_walk_turn_around_(same_direction)_stageii.pt
+      rsi_skipped_range: []
+      weight: 1.0

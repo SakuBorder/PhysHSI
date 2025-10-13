@@ -1,0 +1,13 @@
+ipdb
+keyboard
+muon_optimizer
+numpy==1.23.5
+onnx
+onnxruntime
+pydelatin
+pyfqmr
+scipy
+setuptools
+tqdm
+wandb
+tensorboard
