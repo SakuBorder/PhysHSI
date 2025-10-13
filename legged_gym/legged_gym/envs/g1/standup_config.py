@@ -155,7 +155,7 @@ class G1Cfg(LeggedRobotCfg):
         thickness = 0.01
 
         class chair:
-            base_size = [0.5, 0.8, 0.01]
+            base_size = [0.4, 0.8, 0.01]
             use_random = True
 
             random_size = use_random
@@ -166,7 +166,7 @@ class G1Cfg(LeggedRobotCfg):
             hybrid_init_prob = 0.8 # prob of random, for hybrid mode
 
             skill = ["loco", "standup"]
-            skill_init_prob = [0.2, 0.8]
+            skill_init_prob = [0.3, 0.7]
 
             chair_height_mean = 0.4
             chair_height_var = 0.2
@@ -235,7 +235,6 @@ class G1Cfg(LeggedRobotCfg):
             torque_limits = -0.03
 
             # task rewards
-            sitstable_task = 1.0
             standup_task = 1.0
             loco_task = 1.0
             loco_near_task = 1.0

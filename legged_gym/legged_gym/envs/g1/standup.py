@@ -1732,34 +1732,7 @@ class LeggedRobot(BaseTask):
     def _reward_deviation_ankle_joint(self):
         return torch.sum(torch.square(self.dof_pos - self.default_dof_pos)[:, self.ankle_joint_indices], dim=-1)
 
-    # stage 1: stand still
-    def _reward_sitstable_task(self):
-        # variable define
-        humanoid_root_pos = self.root_states[..., 0:3]
-        humanoid_root_vel = self.root_states[..., 7:10]
-        humanoid_root_ang_vel = self.root_states[..., 10:13]
-
-        # reward_height
-        height_error = self.chair_states[...,2] + 0.12 - humanoid_root_pos[...,2]
-        height_error = torch.clip(height_error, min=0.0)
-        reward_sitstable_height = torch.exp(-5.0 * height_error)
-
-        # reward_vel
-        root_vel_norm = torch.norm(humanoid_root_vel, dim=-1)
-        root_vel_error = torch.exp(-5.0 * root_vel_norm)
-        root_ang_vel_norm = torch.norm(humanoid_root_ang_vel, dim=-1)
-        root_ang_vel_error = torch.exp(-5.0 * root_ang_vel_norm)
-
-        reward_sitstable = 0.1 * root_vel_error + 0.1 * root_ang_vel_error + 0.8 * reward_sitstable_height
-
-        dist_mask_sit_stable = self.robot2chair_dist_xyz < 0.3
-        self._sit_duration[dist_mask_sit_stable] += 1
-        task_mask = (self._sit_duration > 50)
-        reward_sitstable[task_mask] = 1.0
-
-        return reward_sitstable
-
-    # stage 2: get up
+    # stage 1: get up
     def _reward_standup_task(self):
         # variable define
         humanoid_root_pos = self.root_states[..., 0:3]
@@ -1773,14 +1746,12 @@ class LeggedRobot(BaseTask):
 
         reward_standup = reward_standup_height
 
-        # in_stage1_mask = (self._sit_duration < 50)
-        # reward_standup[in_stage1_mask] = 0.0
-        in_stage3_mask = dist_mask_height_high & (self.robot2chair_dist_xy > self.cfg.rewards.thresh_robot2chair)
-        reward_standup[in_stage3_mask] = 1.0
+        in_stage2_mask = dist_mask_height_high & (self.robot2chair_dist_xy > self.cfg.rewards.thresh_robot2chair)
+        reward_standup[in_stage2_mask] = 1.0
 
         return reward_standup
 
-    # stage 3: walk to the destination
+    # stage 2: walk to the destination
     def _reward_loco_task(self):
         global_lin_vel = self.rigid_body_states[:, self.upper_body_index, 7:10]
         robot2marker_dir = self._marker_pos[:, :2] - self.root_states[:, :2]
@@ -1796,14 +1767,14 @@ class LeggedRobot(BaseTask):
         loco_reward = (self.cfg.rewards.robot2marker_vel * robot2marker_vel_reward + 
                        self.cfg.rewards.loco_heading * loco_heading_reward)
         
-        in_stage1_2_mask = self.robot2chair_dist_xy < self.cfg.rewards.thresh_robot2chair
-        loco_reward[in_stage1_2_mask] = 0.0
-        in_stage4_mask = robot2marker_dir.norm(dim=-1) < 0.5
-        loco_reward[in_stage4_mask] = self.cfg.rewards.robot2marker_vel + self.cfg.rewards.loco_heading
+        in_stage1_mask = self.robot2chair_dist_xy < self.cfg.rewards.thresh_robot2chair
+        loco_reward[in_stage1_mask] = 0.0
+        in_stage3_mask = robot2marker_dir.norm(dim=-1) < 0.5
+        loco_reward[in_stage3_mask] = self.cfg.rewards.robot2marker_vel + self.cfg.rewards.loco_heading
 
         return loco_reward
 
-    # stage 4: reach the destination
+    # stage 3: reach the destination
     def _reward_loco_near_task(self):
         # reward no vel
         humanoid_root_vel = self.root_states[..., 7:10]
@@ -1821,7 +1792,7 @@ class LeggedRobot(BaseTask):
             + self.cfg.rewards.no_vel * root_vel_error \
             + self.cfg.rewards.no_ang_vel * root_ang_vel_error
 
-        in_stage4_mask = robot2marker_dir < 0.5
-        reward_near[~in_stage4_mask] = 0.0
+        in_stage3_mask = robot2marker_dir < 0.5
+        reward_near[~in_stage3_mask] = 0.0
 
         return reward_near

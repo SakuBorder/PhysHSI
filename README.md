@@ -110,7 +110,7 @@ CarryBox is a challenging long-horizon task. We train it in two steps:
     python legged_gym/scripts/train.py --task carrybox --headless 
     ```
 
-2. **Refined training**: To better align with the data, manually increase the AMP coefficient and continue training for about 30k steps:
+2. **Refined training**: To better align with the data, manually increase the AMP coefficient and continue training for about 30~40k steps:
     ```bash
     python legged_gym/scripts/train.py --task carrybox_resume --resume --resume_path [ckpt_path] --headless
     ```
