@@ -155,10 +155,11 @@ class LeggedRobot(BaseTask):
             self.dof_pos[env_id] = self.motionlib.motion_dof_pos[time]
             self.dof_vel[env_id] = self.motionlib.motion_dof_vel[time]
 
-        env_ids_int32 = torch.arange(self.num_envs, device=self.device).to(dtype=torch.int32)
+        actor_ids = self._robot_actor_ids
+        env_ids_int32 = torch.arange(self.num_envs, device=self.device, dtype=torch.int32)
         self.gym.set_actor_root_state_tensor_indexed(self.sim,
-                                                     gymtorch.unwrap_tensor(self.root_states),
-                                                     gymtorch.unwrap_tensor(env_ids_int32), len(env_ids_int32))
+                                                     gymtorch.unwrap_tensor(self._root_states_flat),
+                                                     gymtorch.unwrap_tensor(actor_ids), actor_ids.numel())
         self.gym.set_dof_state_tensor_indexed(self.sim,
                                               gymtorch.unwrap_tensor(self.dof_state),
                                               gymtorch.unwrap_tensor(env_ids_int32), len(env_ids_int32))
@@ -741,10 +742,11 @@ class LeggedRobot(BaseTask):
             self._reset_default(default_reset_ids)
     
     def _reset_env_tensors(self, env_ids):
+        actor_ids = self._robot_actor_ids[env_ids].contiguous()
         env_ids_int32 = env_ids.to(dtype=torch.int32)
         self.gym.set_actor_root_state_tensor_indexed(self.sim,
-                                                     gymtorch.unwrap_tensor(self.root_states),
-                                                     gymtorch.unwrap_tensor(env_ids_int32), len(env_ids_int32))
+                                                     gymtorch.unwrap_tensor(self._root_states_flat),
+                                                     gymtorch.unwrap_tensor(actor_ids), actor_ids.numel())
 
         self.gym.set_dof_state_tensor_indexed(self.sim,
                                               gymtorch.unwrap_tensor(self.dof_state),
@@ -824,24 +826,22 @@ class LeggedRobot(BaseTask):
         if self._traj_marker_asset is None:
             return
 
-        num_actors = self.root_states.shape[0] // self.num_envs
-        root_states_view = self.root_states.view(self.num_envs, num_actors, self.root_states.shape[-1])
-
+        num_actors = self._root_states_all.shape[1]
         start_idx = 1
         end_idx = start_idx + self._num_traj_samples
 
-        self._traj_marker_states = root_states_view[:, start_idx:end_idx, :]
+        self._traj_marker_states = self._root_states_all[:, start_idx:end_idx, :]
         self._traj_marker_pos = self._traj_marker_states[..., :3]
 
         target_idx = end_idx
-        self._traj_target_states = root_states_view[:, target_idx, :]
+        self._traj_target_states = self._root_states_all[:, target_idx, :]
         self._traj_target_pos = self._traj_target_states[..., :3]
 
-        env_offsets = torch.arange(self.num_envs, dtype=torch.int32, device=self.root_states.device) * num_actors
-        sample_offsets = torch.arange(start_idx, end_idx, dtype=torch.int32, device=self.root_states.device)
+        env_offsets = torch.arange(self.num_envs, dtype=torch.int32, device=self._root_states_flat.device) * num_actors
+        sample_offsets = torch.arange(start_idx, end_idx, dtype=torch.int32, device=self._root_states_flat.device)
         self._traj_marker_actor_ids = (env_offsets.unsqueeze(-1) + sample_offsets.unsqueeze(0)).reshape(-1)
 
-        target_offset = torch.tensor(target_idx, dtype=torch.int32, device=self.root_states.device)
+        target_offset = torch.tensor(target_idx, dtype=torch.int32, device=self._root_states_flat.device)
         self._traj_target_actor_ids = env_offsets + target_offset
 
     def _update_traj_markers(self):
@@ -857,7 +857,7 @@ class LeggedRobot(BaseTask):
             actor_ids = torch.cat((actor_ids, self._traj_target_actor_ids), dim=0)
 
         self.gym.set_actor_root_state_tensor_indexed(self.sim,
-                                                     gymtorch.unwrap_tensor(self.root_states),
+                                                     gymtorch.unwrap_tensor(self._root_states_flat),
                                                      gymtorch.unwrap_tensor(actor_ids),
                                                      actor_ids.numel())
 
@@ -896,7 +896,7 @@ class LeggedRobot(BaseTask):
         """
         max_vel = self.cfg.domain_rand.max_push_vel_xy
         self.root_states[:, 7:9] = torch_rand_float(-max_vel, max_vel, (self.num_envs, 2), device=self.device) # lin vel x/y
-        self.gym.set_actor_root_state_tensor(self.sim, gymtorch.unwrap_tensor(self.root_states))
+        self.gym.set_actor_root_state_tensor(self.sim, gymtorch.unwrap_tensor(self._root_states_flat))
 
     def _disturbance_robots(self):
         """ Random add disturbance force to the robots.
@@ -946,8 +946,22 @@ class LeggedRobot(BaseTask):
         self.gym.refresh_rigid_body_state_tensor(self.sim)
 
         # create some wrapper tensors for different slices
-        self.root_states = gymtorch.wrap_tensor(actor_root_state)
-        self.rigid_body_states = gymtorch.wrap_tensor(rigid_body_state).view(self.num_envs, self.num_bodies, 13)
+        root_states_all = gymtorch.wrap_tensor(actor_root_state).view(self.num_envs, -1, 13)
+        self._root_states_flat = root_states_all.view(-1, 13)
+        self.root_states = root_states_all[:, 0, :]
+        self._root_states_all = root_states_all
+        self._num_actors_per_env = root_states_all.shape[1]
+
+        env_offsets = torch.arange(self.num_envs, dtype=torch.int32, device=self.device)
+        self._robot_actor_ids = env_offsets * self._num_actors_per_env
+
+        rigid_body_states_all = gymtorch.wrap_tensor(rigid_body_state).view(self.num_envs, -1, 13)
+        self._rigid_body_states = rigid_body_states_all
+        self.rigid_body_states = rigid_body_states_all[:, :self.num_bodies, :]
+
+        net_contact_forces_all = gymtorch.wrap_tensor(net_contact_forces).view(self.num_envs, -1, 3)
+        self._net_contact_forces = net_contact_forces_all
+
         self.dof_state = gymtorch.wrap_tensor(dof_state_tensor)
         self.dof_pos = self.dof_state.view(self.num_envs, self.num_dof, 2)[..., 0]
         self.dof_vel = self.dof_state.view(self.num_envs, self.num_dof, 2)[..., 1]
@@ -959,7 +973,10 @@ class LeggedRobot(BaseTask):
         self.left_feet_pos = self.rigid_body_states[:, self.left_feet_indices, 0:3]
         self.right_feet_pos = self.rigid_body_states[:, self.right_feet_indices, 0:3]
 
-        self.contact_forces = gymtorch.wrap_tensor(net_contact_forces).view(self.num_envs, self.num_bodies, 3) # shape: num_envs, num_bodies, xyz axis
+        # ``self.contact_forces`` only tracks robot contacts while the cached
+        # tensor ``self._net_contact_forces`` includes the per-environment
+        # markers spawned for trajectory visualization.
+        self.contact_forces = self._net_contact_forces[:, :self.num_bodies, :]
 
         # initialize some data used later on
         self.common_step_counter = 0
