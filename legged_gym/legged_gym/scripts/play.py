@@ -33,6 +33,7 @@ def play(args):
     if args.task == 'carrybox':
         env_cfg.asset.box.random_props = False
         env_cfg.asset.box.reset_mode = 'default'
+        env_cfg.env.episode_length_s = 10
     # sitdown
     if args.task == 'sitdown' or args.task == 'liedown':
         env_cfg.asset.chair.random_size = False

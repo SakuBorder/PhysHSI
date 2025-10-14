@@ -21,7 +21,7 @@
 </p>
 
 <p align="center">
-  <a href="https://arxiv.org/abs/2502.08378"><img src="https://img.shields.io/badge/arXiv-2502.08378-brown" alt="arXiv"></a>
+  <a href="https://arxiv.org/abs/2510.11072"><img src="https://img.shields.io/badge/arXiv-2510.11072-brown" alt="arXiv"></a>
   <a href="https://youtu.be/dTj6FjoQ5u0"><img src="https://img.shields.io/badge/Youtube-🎬-yellow" alt="YouTube"></a>
   <a href="https://why618188.github.io/physhsi/"><img src="https://img.shields.io/badge/Website-%F0%9F%9A%80-green" alt="Website"></a>
   <a href="https://creativecommons.org/licenses/by-nc-sa/4.0/"><img src="https://img.shields.io/badge/License-CC%20BY--NC--SA%204.0-lightgrey.svg" alt="License: CC BY-NC-SA 4.0"></a>
@@ -155,7 +155,7 @@ If you find our work helpful, please cite:
 @article{wang2025physhsi,
   title   = {PhysHSI: Towards a Real-World Generalizable and Natural Humanoid-Scene Interaction System},
   author  = {Wang, Huayi and Zhang, Wentao and Yu, Runyi and Huang, Tao and Ren, Junli and Jia, Feiyu and Wang, Zirui and Niu, Xiaojie and Chen, Xiao and Chen, Jiahe and Chen, Qifeng and Wang, Jingbo and Pang, Jiangmiao},
-  journal = {arXiv preprint arXiv:xxxx.xxxxx},
+  journal = {arXiv preprint arXiv:2510.11072},
   year    = {2025},
 }
 ```
