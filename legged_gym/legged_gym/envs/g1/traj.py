@@ -45,6 +45,7 @@ from legged_gym.utils.terrain import Terrain
 from legged_gym.utils.math import wrap_to_pi
 from legged_gym.utils.helpers import class_to_dict
 from legged_gym.utils.torch_utils import calc_heading_quat_inv, quat_to_tan_norm, euler_from_quaternion
+from legged_gym.utils import traj_generator
 
 from legged_gym.envs.base.base_task import BaseTask
 from legged_gym.envs.base.legged_robot_config import LeggedRobotCfg
@@ -70,19 +71,49 @@ class LeggedRobot(BaseTask):
         self.debug_viz = False
         self.init_done = False
         self._parse_cfg(self.cfg)
+        self._traj_marker_asset = None
+        self._traj_marker_handles = []
+        self._traj_target_handles = []
+        self._traj_marker_states = None
+        self._traj_target_states = None
+        self._traj_marker_pos = None
+        self._traj_target_pos = None
+        self._traj_marker_actor_ids = None
+        self._traj_target_actor_ids = None
+
+        self.num_task_obs = getattr(self.cfg.env, "num_task_obs", 0)
+        self.enable_traj_task = self.num_task_obs > 0 and hasattr(self.cfg, "traj")
+        if self.enable_traj_task:
+            self._num_traj_samples = self.cfg.traj.num_samples
+            self._traj_sample_timestep = self.cfg.traj.sample_timestep
+            self._traj_speed_min = self.cfg.traj.speed_min
+            self._traj_speed_max = self.cfg.traj.speed_max
+            self._traj_accel_max = self.cfg.traj.accel_max
+            self._sharp_turn_prob = self.cfg.traj.sharp_turn_prob
+            self._sharp_turn_angle = self.cfg.traj.sharp_turn_angle
+            self._traj_fail_dist = self.cfg.traj.fail_dist
+            self._traj_num_verts = self.cfg.traj.num_vertices
+            self._traj_dtheta_max = self.cfg.traj.dtheta_max
+
         super().__init__(self.cfg, sim_params, physics_engine, sim_device, headless)
-        
+
         self.num_one_step_proprio_obs = self.cfg.env.num_one_step_proprio_obs
         self.actor_history_length = self.cfg.env.num_actor_history
         self.actor_obs_length = self.cfg.env.num_actor_obs
-        
+        self.num_one_step_actor_obs = self.num_one_step_proprio_obs + self.num_task_obs
+
         self.num_privileged_obs = self.cfg.env.num_privileged_obs
 
         if not self.headless:
             self.set_camera(self.cfg.viewer.pos, self.cfg.viewer.lookat)
         self._init_buffers()
+        if self.enable_traj_task:
+            self._build_traj_generator()
+        else:
+            self._traj_gen = None
         self._prepare_reward_function()
         self.num_amp_obs = cfg.amp.num_obs
+
         self.init_done = True
         self.amp_obs_buf = torch.zeros(self.num_envs, self.num_amp_obs, device=self.device, dtype=torch.float)
 
@@ -124,10 +155,11 @@ class LeggedRobot(BaseTask):
             self.dof_pos[env_id] = self.motionlib.motion_dof_pos[time]
             self.dof_vel[env_id] = self.motionlib.motion_dof_vel[time]
 
-        env_ids_int32 = torch.arange(self.num_envs, device=self.device).to(dtype=torch.int32)
+        actor_ids = self._robot_actor_ids
+        env_ids_int32 = torch.arange(self.num_envs, device=self.device, dtype=torch.int32)
         self.gym.set_actor_root_state_tensor_indexed(self.sim,
-                                                     gymtorch.unwrap_tensor(self.root_states),
-                                                     gymtorch.unwrap_tensor(env_ids_int32), len(env_ids_int32))
+                                                     gymtorch.unwrap_tensor(self._root_states_flat),
+                                                     gymtorch.unwrap_tensor(actor_ids), actor_ids.numel())
         self.gym.set_dof_state_tensor_indexed(self.sim,
                                               gymtorch.unwrap_tensor(self.dof_state),
                                               gymtorch.unwrap_tensor(env_ids_int32), len(env_ids_int32))
@@ -158,10 +190,18 @@ class LeggedRobot(BaseTask):
         root_rot_obs = quat_to_tan_norm(root_rot_obs)
 
         current_amp_obs = torch.cat((base_height, dof_pos, self.end_effector_pos, base_lin_vel, base_ang_vel, root_rot_obs), dim=-1)
-            
+
         self.amp_obs_buf = torch.cat((self.amp_obs_buf[:, self.cfg.amp.num_one_step_obs:], current_amp_obs), dim=-1)
-        
+
         return self.amp_obs_buf.clone()
+
+    def render(self, sync_frame_time=True):
+        super().render(sync_frame_time)
+
+        if self.viewer and self.enable_traj_task:
+            self._draw_traj_task()
+
+        return
 
     def post_physics_step(self):
         """ check terminations, compute observations and rewards
@@ -192,14 +232,17 @@ class LeggedRobot(BaseTask):
             self.end_effector_pos[:, 3*i: 3*i+3] = quat_rotate_inverse(self.rigid_body_states[:, self.upper_body_index, 3:7], self.end_effector_pos[:, 3*i: 3*i+3])
 
         self.projected_gravity[:] = quat_rotate_inverse(self.rigid_body_states[:, self.upper_body_index, 3:7], self.gravity_vec)
-        
+
         self.feet_pos[:] = self.rigid_body_states[:, self.feet_indices, 0:3]
         self.feet_quat[:] = self.rigid_body_states[:, self.feet_indices, 3:7]
         self.feet_vel[:] = self.rigid_body_states[:, self.feet_indices, 7:10]
 
+        if self.enable_traj_task:
+            self._update_traj_target()
+
         self.left_feet_pos = self.rigid_body_states[:, self.left_feet_indices, 0:3]
         self.right_feet_pos = self.rigid_body_states[:, self.right_feet_indices, 0:3]
-        
+
         # compute contact related quantities
         contact = torch.norm(self.contact_forces[:, self.feet_indices], dim=-1) > 1.0
         self.contact_filt = torch.logical_or(contact, self.last_contacts) 
@@ -250,6 +293,9 @@ class LeggedRobot(BaseTask):
         self.reset_buf |= torch.logical_or(torch.abs(self.roll)>0.5, torch.abs(self.pitch-0.25)>0.85)
         self.reset_buf |= self.time_out_buf
         self.reset_buf |= self.root_states[:, 2] < 0.35
+        if self.enable_traj_task:
+            traj_dist = torch.norm(self._traj_curr_target[:, :2] - self.root_states[:, 0:2], dim=-1)
+            self.reset_buf |= traj_dist > self._traj_fail_dist
 
     def reset_idx(self, env_ids):
         """ Reset some environments.
@@ -271,6 +317,8 @@ class LeggedRobot(BaseTask):
         self._reset_actors(env_ids)
         self._resample_commands(env_ids)
         self._reset_env_tensors(env_ids)
+        if self.enable_traj_task:
+            self._reset_traj_follow_task(env_ids)
 
         # reset buffers
         self.last_actions[env_ids] = 0.
@@ -353,10 +401,15 @@ class LeggedRobot(BaseTask):
         # add noise if needed
         if self.add_noise:
             current_actor_obs = current_actor_obs + (2 * torch.rand_like(current_actor_obs) - 1) * self.noise_scale_vec[0:(9 + 2 * self.num_dof + self.num_actions + 15)]
-        
-        # actor & critic observations
-        self.obs_buf = torch.cat((self.obs_buf[:, self.num_one_step_proprio_obs:], current_actor_obs), dim=-1)
-        self.privileged_obs_buf = current_obs.clone()
+
+        if self.enable_traj_task:
+            task_obs_actor, task_obs_critic = self.compute_task_observations()
+            self.obs_buf = torch.cat((self.obs_buf[:, self.num_one_step_actor_obs:], current_actor_obs, task_obs_actor), dim=-1)
+            self.privileged_obs_buf = torch.cat((current_obs, task_obs_critic), dim=-1)
+        else:
+            # actor & critic observations
+            self.obs_buf = torch.cat((self.obs_buf[:, self.num_one_step_proprio_obs:], current_actor_obs), dim=-1)
+            self.privileged_obs_buf = current_obs.clone()
         
     def compute_termination_observations(self, env_ids):
         """ Computes observations
@@ -372,7 +425,22 @@ class LeggedRobot(BaseTask):
                                  self.base_lin_vel * self.obs_scales.lin_vel,
                                  ), dim=-1)
             
+        if self.enable_traj_task:
+            _, task_obs_critic = self.compute_task_observations()
+            return torch.cat((current_obs, task_obs_critic), dim=-1)[env_ids]
+
         return current_obs[env_ids]
+
+    def compute_task_observations(self):
+        if not self.enable_traj_task:
+            zero = torch.zeros(self.num_envs, 0, dtype=self.root_states.dtype, device=self.device)
+            return zero, zero
+
+        traj_samples = self._fetch_traj_samples()
+        self._traj_samples_buf[:] = traj_samples
+        task_obs = compute_location_observations(self.root_states, traj_samples)
+        self.traj_obs_buf = task_obs
+        return task_obs, task_obs
         
     def create_sim(self):
         """ Creates simulation, terrain and evironments
@@ -674,21 +742,159 @@ class LeggedRobot(BaseTask):
             self._reset_default(default_reset_ids)
     
     def _reset_env_tensors(self, env_ids):
+        actor_ids = self._robot_actor_ids[env_ids].contiguous()
         env_ids_int32 = env_ids.to(dtype=torch.int32)
         self.gym.set_actor_root_state_tensor_indexed(self.sim,
-                                                     gymtorch.unwrap_tensor(self.root_states),
-                                                     gymtorch.unwrap_tensor(env_ids_int32), len(env_ids_int32))
-        
+                                                     gymtorch.unwrap_tensor(self._root_states_flat),
+                                                     gymtorch.unwrap_tensor(actor_ids), actor_ids.numel())
+
         self.gym.set_dof_state_tensor_indexed(self.sim,
                                               gymtorch.unwrap_tensor(self.dof_state),
                                               gymtorch.unwrap_tensor(env_ids_int32), len(env_ids_int32))
+
+    def _build_traj_generator(self):
+        episode_dur = self.max_episode_length * self.dt
+        self._traj_gen = traj_generator.TrajGenerator(self.num_envs,
+                                                      episode_dur,
+                                                      self._traj_num_verts,
+                                                      self.device,
+                                                      self._traj_dtheta_max,
+                                                      self._traj_speed_min,
+                                                      self._traj_speed_max,
+                                                      self._traj_accel_max,
+                                                      self._sharp_turn_prob,
+                                                      self._sharp_turn_angle)
+
+        env_ids = torch.arange(self.num_envs, device=self.device, dtype=torch.long)
+        init_pos = self.root_states[env_ids, 0:3]
+        self._traj_gen.reset(env_ids, init_pos)
+        self._traj_samples_buf = torch.zeros(self.num_envs, self._num_traj_samples, 3,
+                                             dtype=torch.float, device=self.device, requires_grad=False)
+        time_zero = torch.zeros_like(env_ids, dtype=torch.float)
+        self._traj_curr_target = self._traj_gen.calc_pos(env_ids, time_zero)
+
+    def _load_traj_marker_asset(self):
+        asset_root = f"{LEGGED_GYM_ROOT_DIR}/resources/objects"
+        asset_file = "location_marker.urdf"
+
+        asset_options = gymapi.AssetOptions()
+        asset_options.angular_damping = 0.01
+        asset_options.linear_damping = 0.01
+        asset_options.max_angular_velocity = 100.0
+        asset_options.density = 1.0
+        asset_options.fix_base_link = True
+        asset_options.default_dof_drive_mode = gymapi.DOF_MODE_NONE
+
+        self._traj_marker_asset = self.gym.load_asset(self.sim, asset_root, asset_file, asset_options)
+
+    def _build_traj_markers(self, env_id, env_ptr):
+        col_group = self.num_envs + 10
+        col_filter = 1
+        segmentation_id = 0
+        default_pose = gymapi.Transform()
+
+        sample_handles = []
+        for i in range(self._num_traj_samples):
+            marker_handle = self.gym.create_actor(env_ptr,
+                                                  self._traj_marker_asset,
+                                                  default_pose,
+                                                  f"traj_sample_{env_id}_{i}",
+                                                  col_group,
+                                                  col_filter,
+                                                  segmentation_id)
+            self.gym.set_actor_scale(env_ptr, marker_handle, 0.5)
+            self.gym.set_rigid_body_color(env_ptr, marker_handle, 0,
+                                          gymapi.MESH_VISUAL,
+                                          gymapi.Vec3(1.0, 0.0, 0.0))
+            sample_handles.append(marker_handle)
+
+        target_handle = self.gym.create_actor(env_ptr,
+                                              self._traj_marker_asset,
+                                              default_pose,
+                                              f"traj_target_{env_id}",
+                                              col_group,
+                                              col_filter,
+                                              segmentation_id)
+        self.gym.set_actor_scale(env_ptr, target_handle, 0.6)
+        self.gym.set_rigid_body_color(env_ptr, target_handle, 0,
+                                      gymapi.MESH_VISUAL,
+                                      gymapi.Vec3(0.0, 1.0, 0.0))
+
+        return sample_handles, target_handle
+
+    def _build_traj_marker_state_tensors(self):
+        if self._traj_marker_asset is None:
+            return
+
+        num_actors = self._root_states_all.shape[1]
+        start_idx = 1
+        end_idx = start_idx + self._num_traj_samples
+
+        self._traj_marker_states = self._root_states_all[:, start_idx:end_idx, :]
+        self._traj_marker_pos = self._traj_marker_states[..., :3]
+
+        target_idx = end_idx
+        self._traj_target_states = self._root_states_all[:, target_idx, :]
+        self._traj_target_pos = self._traj_target_states[..., :3]
+
+        env_offsets = torch.arange(self.num_envs, dtype=torch.int32, device=self._root_states_flat.device) * num_actors
+        sample_offsets = torch.arange(start_idx, end_idx, dtype=torch.int32, device=self._root_states_flat.device)
+        self._traj_marker_actor_ids = (env_offsets.unsqueeze(-1) + sample_offsets.unsqueeze(0)).reshape(-1)
+
+        target_offset = torch.tensor(target_idx, dtype=torch.int32, device=self._root_states_flat.device)
+        self._traj_target_actor_ids = env_offsets + target_offset
+
+    def _update_traj_markers(self):
+        if self._traj_marker_states is None:
+            return
+
+        traj_samples = self._fetch_traj_samples().detach()
+        self._traj_marker_pos[:] = traj_samples
+        self._traj_target_pos[:] = self._traj_curr_target.detach()
+
+        actor_ids = self._traj_marker_actor_ids
+        if self._traj_target_actor_ids is not None:
+            actor_ids = torch.cat((actor_ids, self._traj_target_actor_ids), dim=0)
+
+        self.gym.set_actor_root_state_tensor_indexed(self.sim,
+                                                     gymtorch.unwrap_tensor(self._root_states_flat),
+                                                     gymtorch.unwrap_tensor(actor_ids),
+                                                     actor_ids.numel())
+
+    def _reset_traj_follow_task(self, env_ids):
+        if env_ids.numel() == 0:
+            return
+        env_ids_long = env_ids.to(device=self.device, dtype=torch.long)
+        root_pos = self.root_states.index_select(0, env_ids_long)[:, 0:3]
+        self._traj_gen.reset(env_ids_long, root_pos)
+        time_zero = torch.zeros_like(env_ids_long, dtype=torch.float)
+        self._traj_curr_target.index_copy_(0, env_ids_long, self._traj_gen.calc_pos(env_ids_long, time_zero))
+
+    def _fetch_traj_samples(self, env_ids=None):
+        if env_ids is None:
+            env_ids = torch.arange(self.num_envs, device=self.device, dtype=torch.long)
+
+        timestep_beg = self.episode_length_buf[env_ids].to(torch.float) * self.dt
+        timesteps = torch.arange(self._num_traj_samples, device=self.device, dtype=torch.float)
+        timesteps = timesteps * self._traj_sample_timestep
+        traj_timesteps = timestep_beg.unsqueeze(-1) + timesteps
+
+        env_ids_long = env_ids.to(dtype=torch.long, device=self.device)
+        return self._traj_gen.calc_pos(env_ids_long, traj_timesteps)
+
+    def _update_traj_target(self):
+        if not self.enable_traj_task:
+            return
+        env_ids = torch.arange(self.num_envs, device=self.device, dtype=torch.long)
+        time = self.episode_length_buf.to(torch.float) * self.dt
+        self._traj_curr_target = self._traj_gen.calc_pos(env_ids, time)
 
     def _push_robots(self):
         """ Random pushes the robots. Emulates an impulse by setting a randomized base velocity. 
         """
         max_vel = self.cfg.domain_rand.max_push_vel_xy
         self.root_states[:, 7:9] = torch_rand_float(-max_vel, max_vel, (self.num_envs, 2), device=self.device) # lin vel x/y
-        self.gym.set_actor_root_state_tensor(self.sim, gymtorch.unwrap_tensor(self.root_states))
+        self.gym.set_actor_root_state_tensor(self.sim, gymtorch.unwrap_tensor(self._root_states_flat))
 
     def _disturbance_robots(self):
         """ Random add disturbance force to the robots.
@@ -738,8 +944,22 @@ class LeggedRobot(BaseTask):
         self.gym.refresh_rigid_body_state_tensor(self.sim)
 
         # create some wrapper tensors for different slices
-        self.root_states = gymtorch.wrap_tensor(actor_root_state)
-        self.rigid_body_states = gymtorch.wrap_tensor(rigid_body_state).view(self.num_envs, self.num_bodies, 13)
+        root_states_all = gymtorch.wrap_tensor(actor_root_state).view(self.num_envs, -1, 13)
+        self._root_states_flat = root_states_all.view(-1, 13)
+        self.root_states = root_states_all[:, 0, :]
+        self._root_states_all = root_states_all
+        self._num_actors_per_env = root_states_all.shape[1]
+
+        env_offsets = torch.arange(self.num_envs, dtype=torch.int32, device=self.device)
+        self._robot_actor_ids = env_offsets * self._num_actors_per_env
+
+        rigid_body_states_all = gymtorch.wrap_tensor(rigid_body_state).view(self.num_envs, -1, 13)
+        self._rigid_body_states = rigid_body_states_all
+        self.rigid_body_states = rigid_body_states_all[:, :self.num_bodies, :]
+
+        net_contact_forces_all = gymtorch.wrap_tensor(net_contact_forces).view(self.num_envs, -1, 3)
+        self._net_contact_forces = net_contact_forces_all
+
         self.dof_state = gymtorch.wrap_tensor(dof_state_tensor)
         self.dof_pos = self.dof_state.view(self.num_envs, self.num_dof, 2)[..., 0]
         self.dof_vel = self.dof_state.view(self.num_envs, self.num_dof, 2)[..., 1]
@@ -751,7 +971,10 @@ class LeggedRobot(BaseTask):
         self.left_feet_pos = self.rigid_body_states[:, self.left_feet_indices, 0:3]
         self.right_feet_pos = self.rigid_body_states[:, self.right_feet_indices, 0:3]
 
-        self.contact_forces = gymtorch.wrap_tensor(net_contact_forces).view(self.num_envs, self.num_bodies, 3) # shape: num_envs, num_bodies, xyz axis
+        # ``self.contact_forces`` only tracks robot contacts while the cached
+        # tensor ``self._net_contact_forces`` includes the per-environment
+        # markers spawned for trajectory visualization.
+        self.contact_forces = self._net_contact_forces[:, :self.num_bodies, :]
 
         # initialize some data used later on
         self.common_step_counter = 0
@@ -782,7 +1005,7 @@ class LeggedRobot(BaseTask):
         self.projected_gravity = quat_rotate_inverse(self.rigid_body_states[:, self.upper_body_index,3:7], self.gravity_vec)
         self.delay_buffer = torch.zeros(self.cfg.domain_rand.max_delay_timesteps, self.num_envs, self.num_actions, dtype=torch.float, device=self.device, requires_grad=False)
         self.noise_scale_vec = self._get_noise_scale_vec(self.cfg)
-        
+
         self.end_effector_pos = torch.concatenate((self.rigid_body_states[:, self.hand_pos_indices[0], :3],
                                                   self.rigid_body_states[:, self.hand_pos_indices[1], :3],
                                                   self.feet_pos[:, 0], self.feet_pos[:, 1],
@@ -790,6 +1013,12 @@ class LeggedRobot(BaseTask):
         self.end_effector_pos = self.end_effector_pos - self.root_states[:, :3].repeat(1, 5)
         for i in range(5):
             self.end_effector_pos[:, 3*i: 3*i+3] = quat_rotate_inverse(self.rigid_body_states[:, self.upper_body_index, 3:7], self.end_effector_pos[:, 3*i: 3*i+3])
+
+        if self.enable_traj_task:
+            self.traj_obs_buf = torch.zeros(self.num_envs, self.num_task_obs, dtype=torch.float, device=self.device, requires_grad=False)
+            self._traj_curr_target = torch.zeros(self.num_envs, 3, dtype=torch.float, device=self.device, requires_grad=False)
+            if not self.headless:
+                self._build_traj_marker_state_tensors()
 
         # joint positions offsets and PD gains
         self.default_dof_pos = torch.zeros(self.num_dof, dtype=torch.float, device=self.device, requires_grad=False)
@@ -971,6 +1200,12 @@ class LeggedRobot(BaseTask):
         dof_props_asset = self.gym.get_asset_dof_properties(robot_asset)
         rigid_shape_props_asset = self.gym.get_asset_rigid_shape_properties(robot_asset)
 
+        if self.enable_traj_task and not self.headless:
+            if self._traj_marker_asset is None:
+                self._load_traj_marker_asset()
+            self._traj_marker_handles = []
+            self._traj_target_handles = []
+
         # save body names from the asset
         body_names = self.gym.get_asset_rigid_body_names(robot_asset)
         self.dof_names = self.gym.get_asset_dof_names(robot_asset)
@@ -1039,6 +1274,11 @@ class LeggedRobot(BaseTask):
             body_props = self._process_rigid_body_props(body_props, i)
             self.gym.set_actor_rigid_body_properties(env_handle, actor_handle, body_props, recomputeInertia=True)
             self.actor_handles.append(actor_handle)
+
+            if self.enable_traj_task and not self.headless:
+                sample_handles, target_handle = self._build_traj_markers(i, env_handle)
+                self._traj_marker_handles.append(sample_handles)
+                self._traj_target_handles.append(target_handle)
 
         self.left_hip_joint_indices = torch.zeros(len(self.cfg.control.left_hip_joints), dtype=torch.long, device=self.device, requires_grad=False)
         for i in range(len(self.cfg.control.left_hip_joints)):
@@ -1165,7 +1405,24 @@ class LeggedRobot(BaseTask):
     def _get_base_heights(self, env_ids=None):
 
         return self.root_states[:, 2].clone()
-    
+
+    def _draw_traj_task(self):
+        if self._traj_gen is None:
+            return
+
+        if self._traj_marker_states is not None:
+            self._update_traj_markers()
+
+        traj_cols = np.array([[0.0, 0.0, 1.0]], dtype=np.float32)
+        self.gym.clear_lines(self.viewer)
+
+        for env_idx, env_ptr in enumerate(self.envs):
+            verts = self._traj_gen.get_traj_verts(env_idx).detach().cpu()
+            if verts.shape[0] > 1:
+                lines = torch.cat([verts[:-1], verts[1:]], dim=-1).numpy()
+                curr_cols = np.broadcast_to(traj_cols, (lines.shape[0], traj_cols.shape[-1]))
+                self.gym.add_lines(self.viewer, env_ptr, lines.shape[0], lines, curr_cols)
+
     def _draw_debug_vis(self, x, y, z, clear=True):
         if clear:
             self.gym.clear_lines(self.viewer)
@@ -1188,7 +1445,14 @@ class LeggedRobot(BaseTask):
         # Tracking of angular velocity commands (yaw)
         ang_vel_error = torch.square(self.commands[:, 2] - self.base_ang_vel[:, 2])
         return torch.exp(-ang_vel_error/self.cfg.rewards.tracking_sigma)
-    
+
+    def _reward_traj_tracking(self):
+        if not self.enable_traj_task:
+            return torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
+
+        root_pos = self.root_states[:, 0:3]
+        return compute_traj_reward(root_pos, self._traj_curr_target)
+
     def _reward_tracking_yaw(self):
         rew = torch.exp(-torch.abs(self.commands[:,2] - self.yaw[:,0]))
         return rew
@@ -1409,3 +1673,31 @@ class LeggedRobot(BaseTask):
 
     def _reward_heading(self):
         return torch.exp(-0.5 * self.ori_error)
+
+
+def compute_location_observations(root_states, traj_samples):
+    root_pos = root_states[:, 0:3]
+    root_rot = root_states[:, 3:7]
+    heading_rot = calc_heading_quat_inv(root_rot)
+
+    heading_rot_exp = torch.broadcast_to(heading_rot.unsqueeze(1), (traj_samples.shape[0], traj_samples.shape[1], 4))
+    root_pos_exp = torch.broadcast_to(root_pos.unsqueeze(1), (traj_samples.shape[0], traj_samples.shape[1], 3))
+
+    local_traj_samples = quat_rotate(heading_rot_exp.reshape(-1, 4), traj_samples.reshape(-1, 3) - root_pos_exp.reshape(-1, 3))
+    obs = local_traj_samples[..., 0:2].reshape(root_pos.shape[0], -1)
+
+    return obs
+
+
+@torch.jit.script
+def compute_traj_reward(root_pos, tar_pos):
+    pos_err_scale = 2.0
+
+    pos_diff = tar_pos[..., 0:2] - root_pos[..., 0:2]
+    pos_err = torch.sum(pos_diff * pos_diff, dim=-1)
+
+    pos_reward = torch.exp(-pos_err_scale * pos_err)
+
+    reward = pos_reward
+
+    return reward

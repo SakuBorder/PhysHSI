@@ -36,29 +36,40 @@ class TrajGenerator():
         self.heading = torch.zeros(num_envs, 1)
         return
 
+    def _to_long_indices(self, ids):
+        if isinstance(ids, torch.Tensor):
+            return ids.to(device=self._device, dtype=torch.long)
+        return torch.as_tensor(ids, device=self._device, dtype=torch.long)
+
     def reset(self, env_ids, init_pos):
-        n = len(env_ids)
-        if (n > 0):
-            num_verts = self.get_num_verts()
-            dtheta = 2 * torch.rand([n, num_verts - 1], device=self._device) - 1.0 # Sample the angles at each waypoint
-            dtheta *= self._dtheta_max * self._dt
+        env_ids = self._to_long_indices(env_ids)
+        n = env_ids.numel()
+        if n == 0:
+            return
 
-            dtheta_sharp = self._sharp_turn_angle * (2 * torch.rand([n, num_verts - 1], device=self._device) - 1.0)
-            sharp_probs = self._sharp_turn_prob * torch.ones_like(dtheta)
-            sharp_mask = torch.bernoulli(sharp_probs) == 1.0
-            dtheta[sharp_mask] = dtheta_sharp[sharp_mask]
+        init_pos = init_pos.to(self._device)
 
-            dtheta[:, 0] = np.pi * (2 * torch.rand([n], device=self._device) - 1.0)
+        num_verts = self.get_num_verts()
+
+        dtheta = 2 * torch.rand([n, num_verts - 1], device=self._device) - 1.0 # Sample the angles at each waypoint
+        dtheta *= self._dtheta_max * self._dt
+
+        dtheta_sharp = self._sharp_turn_angle * (2 * torch.rand([n, num_verts - 1], device=self._device) - 1.0)
+        sharp_probs = self._sharp_turn_prob * torch.ones_like(dtheta)
+        sharp_mask = torch.bernoulli(sharp_probs) == 1.0
+        dtheta[sharp_mask] = dtheta_sharp[sharp_mask]
+
+        dtheta[:, 0] = np.pi * (2 * torch.rand([n], device=self._device) - 1.0)
 
 
-            dspeed = 2 * torch.rand([n, num_verts - 1], device=self._device) - 1.0
-            dspeed *= self._accel_max * self._dt
-            dspeed[:, 0] = (self._speed_max - self._speed_min) * torch.rand([n], device=self._device) + self._speed_min
+        dspeed = 2 * torch.rand([n, num_verts - 1], device=self._device) - 1.0
+        dspeed *= self._accel_max * self._dt
+        dspeed[:, 0] = (self._speed_max - self._speed_min) * torch.rand([n], device=self._device) + self._speed_min
 
-            speed = torch.zeros_like(dspeed)
-            speed[:, 0] = dspeed[:, 0]
-            for i in range(1, dspeed.shape[-1]):
-                speed[:, i] = torch.clip(speed[:, i - 1] + dspeed[:, i], self._speed_min, self._speed_max)
+        speed = torch.zeros_like(dspeed)
+        speed[:, 0] = dspeed[:, 0]
+        for i in range(1, dspeed.shape[-1]):
+            speed[:, i] = torch.clip(speed[:, i - 1] + dspeed[:, i], self._speed_min, self._speed_max)
 
             # ################################################
             # if flags.fixed_path:
@@ -69,21 +80,23 @@ class TrajGenerator():
             #     speed[:] = (self._speed_min + self._speed_max)/2
             # ################################################
 
-            # if flags.slow:
-            #     speed[:] = speed/4
+        # if flags.slow:
+        #     speed[:] = speed/4
 
 
-            dtheta = torch.cumsum(dtheta, dim=-1)
+        dtheta = torch.cumsum(dtheta, dim=-1)
 
-            seg_len = speed * self._dt
+        seg_len = speed * self._dt
 
-            dpos = torch.stack([torch.cos(dtheta), -torch.sin(dtheta), torch.zeros_like(dtheta)], dim=-1)
-            dpos *= seg_len.unsqueeze(-1)
-            dpos[..., 0, 0:2] += init_pos[..., 0:2]
-            vert_pos = torch.cumsum(dpos, dim=-2)
+        dpos = torch.stack([torch.cos(dtheta), -torch.sin(dtheta), torch.zeros_like(dtheta)], dim=-1)
+        dpos *= seg_len.unsqueeze(-1)
+        dpos[..., 0, 0:2] += init_pos[..., 0:2]
+        vert_pos = torch.cumsum(dpos, dim=-2)
 
-            self._verts[env_ids, 0, 0:2] = init_pos[..., 0:2]
-            self._verts[env_ids, 1:] = vert_pos
+        updated_verts = self._verts.index_select(0, env_ids).clone()
+        updated_verts[:, 0, 0:2] = init_pos[..., 0:2]
+        updated_verts[:, 1:] = vert_pos
+        self._verts.index_copy_(0, env_ids, updated_verts)
 
             # ####### ZL: Loading random real-world trajectories #######
             # if flags.real_path:
@@ -147,8 +160,20 @@ class TrajGenerator():
         seg_id1 = torch.ceil(seg_idx).long()
         lerp = seg_idx - seg_id0
 
-        pos0 = self._verts_flat[traj_ids * num_verts + seg_id0]
-        pos1 = self._verts_flat[traj_ids * num_verts + seg_id1]
+        traj_ids = self._to_long_indices(traj_ids)
+        if traj_ids.dim() < seg_id0.dim():
+            view_shape = traj_ids.shape + (1,) * (seg_id0.dim() - traj_ids.dim())
+            base_ids = traj_ids.view(view_shape)
+        else:
+            base_ids = traj_ids
+        seg_id0 = seg_id0.to(dtype=torch.long, device=self._device)
+        seg_id1 = seg_id1.to(dtype=torch.long, device=self._device)
+
+        flat_ids0 = (base_ids * num_verts + seg_id0).reshape(-1)
+        flat_ids1 = (base_ids * num_verts + seg_id1).reshape(-1)
+
+        pos0 = torch.index_select(self._verts_flat, 0, flat_ids0).view(*seg_id0.shape, 3)
+        pos1 = torch.index_select(self._verts_flat, 0, flat_ids1).view(*seg_id1.shape, 3)
 
         lerp = lerp.unsqueeze(-1)
         pos = (1.0 - lerp) * pos0 + lerp * pos1
@@ -166,8 +191,20 @@ class TrajGenerator():
         seg_id1 = torch.ceil(seg_idx).long()
         lerp = seg_idx - seg_id0
 
-        pos0 = self._verts_flat[traj_ids * num_verts + seg_id0]
-        pos1 = self._verts_flat[traj_ids * num_verts + seg_id1]
+        traj_ids = self._to_long_indices(traj_ids)
+        if traj_ids.dim() < seg_id0.dim():
+            view_shape = traj_ids.shape + (1,) * (seg_id0.dim() - traj_ids.dim())
+            base_ids = traj_ids.view(view_shape)
+        else:
+            base_ids = traj_ids
+        seg_id0 = seg_id0.to(dtype=torch.long, device=self._device)
+        seg_id1 = seg_id1.to(dtype=torch.long, device=self._device)
+
+        flat_ids0 = (base_ids * num_verts + seg_id0).reshape(-1)
+        flat_ids1 = (base_ids * num_verts + seg_id1).reshape(-1)
+
+        pos0 = torch.index_select(self._verts_flat, 0, flat_ids0).view(*seg_id0.shape, 3)
+        pos1 = torch.index_select(self._verts_flat, 0, flat_ids1).view(*seg_id1.shape, 3)
 
         lerp = lerp.unsqueeze(-1)
         pos = (1.0 - lerp) * pos0 + lerp * pos1
