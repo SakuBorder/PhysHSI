@@ -1,0 +1,35 @@
+motions:
+  loco:
+    - file: ../dataset/dataset_loco/B1_-_stand_to_walk_stageii.pt
+      rsi_skipped_range: []
+      weight: 1.0
+    - file: ../dataset/dataset_loco/B2_-_walk_to_stand_stageii.pt
+      rsi_skipped_range: []
+      weight: 1.0
+    - file: ../dataset/dataset_loco/B2_-_walk_to_stand_t2_stageii.pt
+      rsi_skipped_range: []
+      weight: 1.0
+    - file: ../dataset/dataset_loco/B3_-_walk1_stageii.pt
+      rsi_skipped_range: []
+      weight: 1.0
+    - file: ../dataset/dataset_loco/B9_-_walk_turn_left_(90)_stageii.pt
+      rsi_skipped_range: []
+      weight: 1.0
+    - file: ../dataset/dataset_loco/B10_-_walk_turn_left_(45)_stageii.pt
+      rsi_skipped_range: []
+      weight: 1.0
+    - file: ../dataset/dataset_loco/B11_-_walk_turn_left_(135)_stageii.pt
+      rsi_skipped_range: []
+      weight: 1.0
+    - file: ../dataset/dataset_loco/B12_-_walk_turn_right_(90)_stageii.pt
+      rsi_skipped_range: []
+      weight: 1.0
+    - file: ../dataset/dataset_loco/B13_-_walk_turn_right_(45)_stageii.pt
+      rsi_skipped_range: []
+      weight: 1.0
+    - file: ../dataset/dataset_loco/B14_-_walk_turn_right_(135)_stageii.pt
+      rsi_skipped_range: []
+      weight: 1.0
+    - file: ../dataset/dataset_loco/B15_-_walk_turn_around_(same_direction)_stageii.pt
+      rsi_skipped_range: []
+      weight: 1.0

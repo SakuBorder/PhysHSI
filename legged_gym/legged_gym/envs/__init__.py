@@ -57,6 +57,8 @@ from .g1.styleloco_dinosaur_config import G1Cfg as G1StyleLocoDinosaurCfg
 from .g1.styleloco_dinosaur_config import G1CfgPPO as G1StyleLocoDinosaurCfgPPO
 from .g1.styleloco_highknee_config import G1Cfg as G1StyleLocoHighKneeCfg
 from .g1.styleloco_highknee_config import G1CfgPPO as G1StyleLocoHighKneeCfgPPO
+from .g1.loco_config import G1Cfg as G1LocoCfg  
+from .g1.loco_config import G1CfgPPO as G1LocoCfgPPO
 
 task_registry.register( "carrybox", G1CarryBox, G1CarryBoxCfg(), G1CarryBoxCfgPPO() )
 task_registry.register( "carrybox_resume", G1CarryBox, G1CarryBoxResumeCfg(), G1CarryBoxResumeCfgPPO() )
@@ -65,3 +67,4 @@ task_registry.register( "liedown", G1LieDown, G1LieDownCfg(), G1LieDownCfgPPO() 
 task_registry.register( "standup", G1Standup, G1StandupCfg(), G1StandupCfgPPO() )
 task_registry.register( "styleloco_dinosaur", G1StyleLoco, G1StyleLocoDinosaurCfg(), G1StyleLocoDinosaurCfgPPO() )
 task_registry.register( "styleloco_highknee", G1StyleLoco, G1StyleLocoHighKneeCfg(), G1StyleLocoHighKneeCfgPPO() )
+task_registry.register( "loco", G1StyleLoco, G1LocoCfg(), G1LocoCfgPPO() )
