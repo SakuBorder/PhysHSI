@@ -864,10 +864,11 @@ class LeggedRobot(BaseTask):
     def _reset_traj_follow_task(self, env_ids):
         if env_ids.numel() == 0:
             return
-        root_pos = self.root_states[env_ids, 0:3]
-        self._traj_gen.reset(env_ids, root_pos)
-        time_zero = torch.zeros_like(env_ids, dtype=torch.float)
-        self._traj_curr_target[env_ids] = self._traj_gen.calc_pos(env_ids, time_zero)
+        env_ids_long = env_ids.to(device=self.device, dtype=torch.long)
+        root_pos = self.root_states.index_select(0, env_ids_long)[:, 0:3]
+        self._traj_gen.reset(env_ids_long, root_pos)
+        time_zero = torch.zeros_like(env_ids_long, dtype=torch.float)
+        self._traj_curr_target.index_copy_(0, env_ids_long, self._traj_gen.calc_pos(env_ids_long, time_zero))
 
     def _fetch_traj_samples(self, env_ids=None):
         if env_ids is None:
@@ -878,11 +879,8 @@ class LeggedRobot(BaseTask):
         timesteps = timesteps * self._traj_sample_timestep
         traj_timesteps = timestep_beg.unsqueeze(-1) + timesteps
 
-        env_ids_tiled = torch.broadcast_to(env_ids.unsqueeze(-1), traj_timesteps.shape)
-        traj_samples_flat = self._traj_gen.calc_pos(env_ids_tiled.flatten(), traj_timesteps.flatten())
-        traj_samples = traj_samples_flat.view(env_ids.shape[0], self._num_traj_samples, -1)
-
-        return traj_samples
+        env_ids_long = env_ids.to(dtype=torch.long, device=self.device)
+        return self._traj_gen.calc_pos(env_ids_long, traj_timesteps)
 
     def _update_traj_target(self):
         if not self.enable_traj_task:
