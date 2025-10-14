@@ -103,6 +103,14 @@ class LeggedRobot(BaseTask):
             self._traj_gen = None
         self._prepare_reward_function()
         self.num_amp_obs = cfg.amp.num_obs
+
+        if self.enable_traj_task and not self.headless:
+            self._traj_sample_geom = gymutil.WireframeSphereGeometry(0.1, 6, 6, None, color=(1.0, 0.0, 0.0))
+            self._traj_target_geom = gymutil.WireframeSphereGeometry(0.12, 8, 8, None, color=(0.0, 1.0, 0.0))
+        else:
+            self._traj_sample_geom = None
+            self._traj_target_geom = None
+
         self.init_done = True
         self.amp_obs_buf = torch.zeros(self.num_envs, self.num_amp_obs, device=self.device, dtype=torch.float)
 
@@ -178,10 +186,18 @@ class LeggedRobot(BaseTask):
         root_rot_obs = quat_to_tan_norm(root_rot_obs)
 
         current_amp_obs = torch.cat((base_height, dof_pos, self.end_effector_pos, base_lin_vel, base_ang_vel, root_rot_obs), dim=-1)
-            
+
         self.amp_obs_buf = torch.cat((self.amp_obs_buf[:, self.cfg.amp.num_one_step_obs:], current_amp_obs), dim=-1)
-        
+
         return self.amp_obs_buf.clone()
+
+    def render(self, sync_frame_time=True):
+        super().render(sync_frame_time)
+
+        if self.viewer and self.enable_traj_task:
+            self._draw_traj_task()
+
+        return
 
     def post_physics_step(self):
         """ check terminations, compute observations and rewards
@@ -1268,7 +1284,32 @@ class LeggedRobot(BaseTask):
     def _get_base_heights(self, env_ids=None):
 
         return self.root_states[:, 2].clone()
-    
+
+    def _draw_traj_task(self):
+        if self._traj_sample_geom is None or self._traj_gen is None:
+            return
+
+        traj_samples = self._fetch_traj_samples().detach().cpu()
+        curr_targets = self._traj_curr_target.detach().cpu()
+
+        traj_cols = np.array([[0.0, 0.0, 1.0]], dtype=np.float32)
+        self.gym.clear_lines(self.viewer)
+
+        for env_idx, env_ptr in enumerate(self.envs):
+            verts = self._traj_gen.get_traj_verts(env_idx).detach().cpu()
+            if verts.shape[0] > 1:
+                lines = torch.cat([verts[:-1], verts[1:]], dim=-1).numpy()
+                curr_cols = np.broadcast_to(traj_cols, (lines.shape[0], traj_cols.shape[-1]))
+                self.gym.add_lines(self.viewer, env_ptr, lines.shape[0], lines, curr_cols)
+
+            for sample in traj_samples[env_idx]:
+                pose = gymapi.Transform(p=gymapi.Vec3(float(sample[0]), float(sample[1]), float(sample[2])))
+                gymutil.draw_lines(self._traj_sample_geom, self.gym, self.viewer, env_ptr, pose)
+
+            target = curr_targets[env_idx]
+            pose = gymapi.Transform(p=gymapi.Vec3(float(target[0]), float(target[1]), float(target[2])))
+            gymutil.draw_lines(self._traj_target_geom, self.gym, self.viewer, env_ptr, pose)
+
     def _draw_debug_vis(self, x, y, z, clear=True):
         if clear:
             self.gym.clear_lines(self.viewer)
