@@ -235,7 +235,7 @@ class G1Cfg(LeggedRobotCfg):
             torque_limits = -0.03
 
             # task rewards
-            standup_task = 1.0
+            standup_task = 3.0
             loco_task = 1.0
             loco_near_task = 1.0
             
