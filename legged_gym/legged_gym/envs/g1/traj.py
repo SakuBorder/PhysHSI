@@ -80,16 +80,8 @@ class LeggedRobot(BaseTask):
         self._traj_target_pos = None
         self._traj_marker_actor_ids = None
         self._traj_target_actor_ids = None
-        super().__init__(self.cfg, sim_params, physics_engine, sim_device, headless)
-        
-        self.num_one_step_proprio_obs = self.cfg.env.num_one_step_proprio_obs
-        self.actor_history_length = self.cfg.env.num_actor_history
-        self.actor_obs_length = self.cfg.env.num_actor_obs
+
         self.num_task_obs = getattr(self.cfg.env, "num_task_obs", 0)
-        self.num_one_step_actor_obs = self.num_one_step_proprio_obs + self.num_task_obs
-
-        self.num_privileged_obs = self.cfg.env.num_privileged_obs
-
         self.enable_traj_task = self.num_task_obs > 0 and hasattr(self.cfg, "traj")
         if self.enable_traj_task:
             self._num_traj_samples = self.cfg.traj.num_samples
@@ -102,6 +94,15 @@ class LeggedRobot(BaseTask):
             self._traj_fail_dist = self.cfg.traj.fail_dist
             self._traj_num_verts = self.cfg.traj.num_vertices
             self._traj_dtheta_max = self.cfg.traj.dtheta_max
+
+        super().__init__(self.cfg, sim_params, physics_engine, sim_device, headless)
+
+        self.num_one_step_proprio_obs = self.cfg.env.num_one_step_proprio_obs
+        self.actor_history_length = self.cfg.env.num_actor_history
+        self.actor_obs_length = self.cfg.env.num_actor_obs
+        self.num_one_step_actor_obs = self.num_one_step_proprio_obs + self.num_task_obs
+
+        self.num_privileged_obs = self.cfg.env.num_privileged_obs
 
         if not self.headless:
             self.set_camera(self.cfg.viewer.pos, self.cfg.viewer.lookat)
