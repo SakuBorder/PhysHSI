@@ -71,6 +71,15 @@ class LeggedRobot(BaseTask):
         self.debug_viz = False
         self.init_done = False
         self._parse_cfg(self.cfg)
+        self._traj_marker_asset = None
+        self._traj_marker_handles = []
+        self._traj_target_handles = []
+        self._traj_marker_states = None
+        self._traj_target_states = None
+        self._traj_marker_pos = None
+        self._traj_target_pos = None
+        self._traj_marker_actor_ids = None
+        self._traj_target_actor_ids = None
         super().__init__(self.cfg, sim_params, physics_engine, sim_device, headless)
         
         self.num_one_step_proprio_obs = self.cfg.env.num_one_step_proprio_obs
@@ -103,13 +112,6 @@ class LeggedRobot(BaseTask):
             self._traj_gen = None
         self._prepare_reward_function()
         self.num_amp_obs = cfg.amp.num_obs
-
-        if self.enable_traj_task and not self.headless:
-            self._traj_sample_geom = gymutil.WireframeSphereGeometry(0.1, 6, 6, None, color=(1.0, 0.0, 0.0))
-            self._traj_target_geom = gymutil.WireframeSphereGeometry(0.12, 8, 8, None, color=(0.0, 1.0, 0.0))
-        else:
-            self._traj_sample_geom = None
-            self._traj_target_geom = None
 
         self.init_done = True
         self.amp_obs_buf = torch.zeros(self.num_envs, self.num_amp_obs, device=self.device, dtype=torch.float)
@@ -768,6 +770,96 @@ class LeggedRobot(BaseTask):
         time_zero = torch.zeros_like(env_ids, dtype=torch.float)
         self._traj_curr_target = self._traj_gen.calc_pos(env_ids, time_zero)
 
+    def _load_traj_marker_asset(self):
+        asset_root = f"{LEGGED_GYM_ROOT_DIR}/resources/objects"
+        asset_file = "location_marker.urdf"
+
+        asset_options = gymapi.AssetOptions()
+        asset_options.angular_damping = 0.01
+        asset_options.linear_damping = 0.01
+        asset_options.max_angular_velocity = 100.0
+        asset_options.density = 1.0
+        asset_options.fix_base_link = True
+        asset_options.default_dof_drive_mode = gymapi.DOF_MODE_NONE
+
+        self._traj_marker_asset = self.gym.load_asset(self.sim, asset_root, asset_file, asset_options)
+
+    def _build_traj_markers(self, env_id, env_ptr):
+        col_group = self.num_envs + 10
+        col_filter = 1
+        segmentation_id = 0
+        default_pose = gymapi.Transform()
+
+        sample_handles = []
+        for i in range(self._num_traj_samples):
+            marker_handle = self.gym.create_actor(env_ptr,
+                                                  self._traj_marker_asset,
+                                                  default_pose,
+                                                  f"traj_sample_{env_id}_{i}",
+                                                  col_group,
+                                                  col_filter,
+                                                  segmentation_id)
+            self.gym.set_actor_scale(env_ptr, marker_handle, 0.5)
+            self.gym.set_rigid_body_color(env_ptr, marker_handle, 0,
+                                          gymapi.MESH_VISUAL,
+                                          gymapi.Vec3(1.0, 0.0, 0.0))
+            sample_handles.append(marker_handle)
+
+        target_handle = self.gym.create_actor(env_ptr,
+                                              self._traj_marker_asset,
+                                              default_pose,
+                                              f"traj_target_{env_id}",
+                                              col_group,
+                                              col_filter,
+                                              segmentation_id)
+        self.gym.set_actor_scale(env_ptr, target_handle, 0.6)
+        self.gym.set_rigid_body_color(env_ptr, target_handle, 0,
+                                      gymapi.MESH_VISUAL,
+                                      gymapi.Vec3(0.0, 1.0, 0.0))
+
+        return sample_handles, target_handle
+
+    def _build_traj_marker_state_tensors(self):
+        if self._traj_marker_asset is None:
+            return
+
+        num_actors = self.root_states.shape[0] // self.num_envs
+        root_states_view = self.root_states.view(self.num_envs, num_actors, self.root_states.shape[-1])
+
+        start_idx = 1
+        end_idx = start_idx + self._num_traj_samples
+
+        self._traj_marker_states = root_states_view[:, start_idx:end_idx, :]
+        self._traj_marker_pos = self._traj_marker_states[..., :3]
+
+        target_idx = end_idx
+        self._traj_target_states = root_states_view[:, target_idx, :]
+        self._traj_target_pos = self._traj_target_states[..., :3]
+
+        env_offsets = torch.arange(self.num_envs, dtype=torch.int32, device=self.root_states.device) * num_actors
+        sample_offsets = torch.arange(start_idx, end_idx, dtype=torch.int32, device=self.root_states.device)
+        self._traj_marker_actor_ids = (env_offsets.unsqueeze(-1) + sample_offsets.unsqueeze(0)).reshape(-1)
+
+        target_offset = torch.tensor(target_idx, dtype=torch.int32, device=self.root_states.device)
+        self._traj_target_actor_ids = env_offsets + target_offset
+
+    def _update_traj_markers(self):
+        if self._traj_marker_states is None:
+            return
+
+        traj_samples = self._fetch_traj_samples().detach()
+        self._traj_marker_pos[:] = traj_samples
+        self._traj_target_pos[:] = self._traj_curr_target.detach()
+
+        actor_ids = self._traj_marker_actor_ids
+        if self._traj_target_actor_ids is not None:
+            actor_ids = torch.cat((actor_ids, self._traj_target_actor_ids), dim=0)
+
+        self.gym.set_actor_root_state_tensor_indexed(self.sim,
+                                                     gymtorch.unwrap_tensor(self.root_states),
+                                                     gymtorch.unwrap_tensor(actor_ids),
+                                                     actor_ids.numel())
+
     def _reset_traj_follow_task(self, env_ids):
         if env_ids.numel() == 0:
             return
@@ -909,6 +1001,8 @@ class LeggedRobot(BaseTask):
         if self.enable_traj_task:
             self.traj_obs_buf = torch.zeros(self.num_envs, self.num_task_obs, dtype=torch.float, device=self.device, requires_grad=False)
             self._traj_curr_target = torch.zeros(self.num_envs, 3, dtype=torch.float, device=self.device, requires_grad=False)
+            if not self.headless:
+                self._build_traj_marker_state_tensors()
 
         # joint positions offsets and PD gains
         self.default_dof_pos = torch.zeros(self.num_dof, dtype=torch.float, device=self.device, requires_grad=False)
@@ -1090,6 +1184,12 @@ class LeggedRobot(BaseTask):
         dof_props_asset = self.gym.get_asset_dof_properties(robot_asset)
         rigid_shape_props_asset = self.gym.get_asset_rigid_shape_properties(robot_asset)
 
+        if self.enable_traj_task and not self.headless:
+            if self._traj_marker_asset is None:
+                self._load_traj_marker_asset()
+            self._traj_marker_handles = []
+            self._traj_target_handles = []
+
         # save body names from the asset
         body_names = self.gym.get_asset_rigid_body_names(robot_asset)
         self.dof_names = self.gym.get_asset_dof_names(robot_asset)
@@ -1158,6 +1258,11 @@ class LeggedRobot(BaseTask):
             body_props = self._process_rigid_body_props(body_props, i)
             self.gym.set_actor_rigid_body_properties(env_handle, actor_handle, body_props, recomputeInertia=True)
             self.actor_handles.append(actor_handle)
+
+            if self.enable_traj_task and not self.headless:
+                sample_handles, target_handle = self._build_traj_markers(i, env_handle)
+                self._traj_marker_handles.append(sample_handles)
+                self._traj_target_handles.append(target_handle)
 
         self.left_hip_joint_indices = torch.zeros(len(self.cfg.control.left_hip_joints), dtype=torch.long, device=self.device, requires_grad=False)
         for i in range(len(self.cfg.control.left_hip_joints)):
@@ -1286,11 +1391,11 @@ class LeggedRobot(BaseTask):
         return self.root_states[:, 2].clone()
 
     def _draw_traj_task(self):
-        if self._traj_sample_geom is None or self._traj_gen is None:
+        if self._traj_gen is None:
             return
 
-        traj_samples = self._fetch_traj_samples().detach().cpu()
-        curr_targets = self._traj_curr_target.detach().cpu()
+        if self._traj_marker_states is not None:
+            self._update_traj_markers()
 
         traj_cols = np.array([[0.0, 0.0, 1.0]], dtype=np.float32)
         self.gym.clear_lines(self.viewer)
@@ -1301,14 +1406,6 @@ class LeggedRobot(BaseTask):
                 lines = torch.cat([verts[:-1], verts[1:]], dim=-1).numpy()
                 curr_cols = np.broadcast_to(traj_cols, (lines.shape[0], traj_cols.shape[-1]))
                 self.gym.add_lines(self.viewer, env_ptr, lines.shape[0], lines, curr_cols)
-
-            for sample in traj_samples[env_idx]:
-                pose = gymapi.Transform(p=gymapi.Vec3(float(sample[0]), float(sample[1]), float(sample[2])))
-                gymutil.draw_lines(self._traj_sample_geom, self.gym, self.viewer, env_ptr, pose)
-
-            target = curr_targets[env_idx]
-            pose = gymapi.Transform(p=gymapi.Vec3(float(target[0]), float(target[1]), float(target[2])))
-            gymutil.draw_lines(self._traj_target_geom, self.gym, self.viewer, env_ptr, pose)
 
     def _draw_debug_vis(self, x, y, z, clear=True):
         if clear:
