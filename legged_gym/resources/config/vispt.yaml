@@ -1,0 +1,5 @@
+motions:
+  loco:
+    - file: ../dataset/walk_g1_23/B9_-__Walk_turn_left_90_stageii.pkl
+      rsi_skipped_range: []
+      weight: 1.0
