@@ -6,6 +6,7 @@
 # 2) 统一用多 actor 根状态张量：self.all_root_states.view(num_envs, num_actors_per_env, 13)
 #    槽位：0=机器人，1..S=轨迹采样点，S+1=目标点（S=self._num_traj_samples）
 # 3) 每步在 _update_traj_markers() 中一次性写回所有 marker 的 root state。
+# 4) 【本版新增】markers 创建时使用“机器人初始化位置”的 x,y（第一帧就对齐）。
 #
 # 需要在 LeggedRobotCfg 里新增（示例）：
 # class MarkerCfg:
@@ -56,7 +57,6 @@ class LeggedRobot(BaseTask):
         self.num_privileged_obs = self.cfg.env.num_privileged_obs
 
         # —— 轨迹任务参数与开关（与 HumanoidTraj 对齐）——
-        # 有 cfg.traj 即启用；任务观测维度 = 2 * S（S=未来采样点个数）
         self.enable_traj_task = hasattr(self.cfg, "traj")
         if self.enable_traj_task:
             self._num_traj_samples = int(self.cfg.traj.num_samples)
@@ -70,7 +70,7 @@ class LeggedRobot(BaseTask):
             self._traj_num_verts = int(self.cfg.traj.num_vertices)
             self._traj_dtheta_max = float(self.cfg.traj.dtheta_max)
 
-            # 强制：任务观测 = S 个未来采样点的 (x, y) => 2*S
+            # 任务观测 = S 个未来采样点的 (x, y) => 2*S
             self.num_task_obs = 2 * self._num_traj_samples
         else:
             self.num_task_obs = 0
@@ -207,7 +207,7 @@ class LeggedRobot(BaseTask):
         self.first_contacts = (self.feet_air_time >= self.dt) * self.contact_filt
         self.feet_air_time += self.dt
 
-        # [FIX] 关节功率“时间窗”更新（历史长度 = actor_history_length）
+        # 关节功率历史
         joint_powers = torch.abs(self.torques * self.dof_vel).unsqueeze(1)
         self.joint_powers = torch.cat((joint_powers, self.joint_powers[:, :-1]), dim=1)
 
@@ -271,7 +271,7 @@ class LeggedRobot(BaseTask):
         self.last_dof_vel[env_ids] = 0.
         self.last_torques[env_ids] = 0.
         self.feet_air_time[env_ids] = 0.
-        self.joint_powers[env_ids] = 0.  # [FIX] reset 时清零
+        self.joint_powers[env_ids] = 0.
         self.delay_buffer[:, env_ids, :] = self.dof_pos[env_ids] - self.default_dof_pos
         self.reset_buf[env_ids] = 1
 
@@ -744,7 +744,7 @@ class LeggedRobot(BaseTask):
         self.p_gains = torch.zeros(self.num_dof, device=self.device)
         self.d_gains = torch.zeros(self.num_dof, device=self.device)
 
-        # [FIX] 明确 num_actions（本环境动作即 DOF 维度）
+        # 明确 num_actions
         self.num_actions = getattr(self, "num_actions", self.num_dof)
 
         self.actions = torch.zeros(self.num_envs, self.num_actions, device=self.device)
@@ -806,7 +806,7 @@ class LeggedRobot(BaseTask):
         self.disturbance = torch.zeros(self.num_envs, self.num_bodies, 3, device=self.device)
         self.zero_force = torch.tensor([0.0, 0.0, 0.0], device=self.device)
 
-        # [FIX] joint_powers 历史缓存（N_env, T_hist, N_dof）
+        # joint_powers 历史缓存（N_env, T_hist, N_dof）
         hist = max(int(self.actor_history_length), 1)
         self.joint_powers = torch.zeros(self.num_envs, hist, self.num_dof, device=self.device)
 
@@ -828,7 +828,7 @@ class LeggedRobot(BaseTask):
             priv_dim += self.num_task_obs
         self.privileged_obs_buf = torch.zeros(self.num_envs, priv_dim, device=self.device)
 
-        # [FIX] rew_buf 的显式初始化
+        # rew_buf 显式初始化
         self.rew_buf = torch.zeros(self.num_envs, device=self.device)
 
         # dataset / AMP
@@ -1006,21 +1006,22 @@ class LeggedRobot(BaseTask):
 
             # markers（槽位 1..S+1）
             if self.enable_traj_task:
-                # 用 base 初始高度 + 可选偏移做可视化初始化
-                org = self.env_origins[i]
-                base_z0 = float(org[2] + self.base_init_state[2] + self._marker_height_offset)
+                # —— 本版修改：用“机器人初始化位置”的 x,y，使第一帧视觉上与机器人完全重合 ——
+                base_z0 = float(pos[2] + self._marker_height_offset)
 
                 for k in range(self._num_traj_samples):  # 采样点
                     mpose = gymapi.Transform()
-                    mpose.p = gymapi.Vec3(float(org[0]), float(org[1]), base_z0)
+                    mpose.p = gymapi.Vec3(float(pos[0]), float(pos[1]), base_z0)
                     h = self.gym.create_actor(env, marker_asset, mpose, f"{self.cfg.marker.asset.name}_sample_{k}", i, 0, 0)
+                    # 设为红色（灰 → 红）
                     self.gym.set_rigid_body_color(env, h, 0, gymapi.MESH_VISUAL, gymapi.Vec3(1.0, 0.0, 0.0))
-
                     self.marker_handles[i].append(h)
+
                 # 目标点
                 tpose = gymapi.Transform()
-                tpose.p = gymapi.Vec3(float(org[0]), float(org[1]), base_z0)
+                tpose.p = gymapi.Vec3(float(pos[0]), float(pos[1]), base_z0)
                 h = self.gym.create_actor(env, marker_asset, tpose, f"{self.cfg.marker.asset.name}_target", i, 0, 0)
+                self.gym.set_rigid_body_color(env, h, 0, gymapi.MESH_VISUAL, gymapi.Vec3(1.0, 0.0, 0.0))
                 self.marker_handles[i].append(h)
 
         # 常用索引
@@ -1273,7 +1274,7 @@ class LeggedRobot(BaseTask):
         knee_pos_in_body_frame = torch.zeros(self.num_envs, len(self.knee_indices), 3, device=self.device)
         for i in range(len(self.knee_indices)):
             knee_pos_in_body_frame[:, i, :] = quat_rotate_inverse(self.base_quat, cur_knee_pos_translated[:, i, :])
-        knee_lateral_dis = torch.abs(knee_pos_in_body_frame[:, 0, 1] - knee_pos_in_body_frame[:, 1, 1])
+        knee_lateral_dis = torch.abs(knee_pos_in_body_frame[:, 0, 1] - self.cfg.rewards.least_knee_distance_lateral)
         return torch.clamp(knee_lateral_dis - self.cfg.rewards.least_knee_distance_lateral, max=0)
 
 

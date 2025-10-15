@@ -255,10 +255,10 @@ class G1Cfg(LeggedRobotCfg):
         ratio_random_range = [0.9, 1.1]
         use_normalizer = False
 
-    class viewer(LeggedRobotCfg.viewer):
+    class viewer:
         ref_env = 0
-        pos = [10, -5, 4]
-        lookat = [11., 3, 2.]
+        pos = [10, 0, 3]
+        lookat = [0.0, 1, 0.0]
 
     class sim(LeggedRobotCfg.sim):
         dt = 0.005
