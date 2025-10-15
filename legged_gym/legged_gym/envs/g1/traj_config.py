@@ -179,13 +179,11 @@ class G1Cfg(LeggedRobotCfg):
         skill = ['loco']
         skill_init_prob = [1.0]
 
-    # === 新增：URDF marker 配置（用于 traj 采样点与目标点，可视化 & 多 actor） ===
     class marker:
         class asset:
-            # 准备一个极简不受重力的小球/小方块 URDF
             file = "{LEGGED_GYM_ROOT_DIR}/resources/objects/location_marker.urdf"
             name = "traj_marker"
-        disable_gravity = True  # 与主代码中 asset_options.disable_gravity 一致
+        disable_gravity = True  
 
     class domain_rand(LeggedRobotCfg.domain_rand):
         use_random = False

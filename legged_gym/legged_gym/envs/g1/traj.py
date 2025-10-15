@@ -6,7 +6,8 @@
 # 2) 统一用多 actor 根状态张量：self.all_root_states.view(num_envs, num_actors_per_env, 13)
 #    槽位：0=机器人，1..S=轨迹采样点，S+1=目标点（S=self._num_traj_samples）
 # 3) 每步在 _update_traj_markers() 中一次性写回所有 marker 的 root state。
-# 4) 【本版新增】markers 创建时使用“机器人初始化位置”的 x,y（第一帧就对齐）。
+# 4) markers 创建时使用“机器人初始化位置”的 x,y（第一帧就对齐）。
+# 5) 关闭 marker 碰撞（shape.filter = 0xFFFF），并让 marker 高度保持常数（不随 base 高度变化）。
 #
 # 需要在 LeggedRobotCfg 里新增（示例）：
 # class MarkerCfg:
@@ -15,7 +16,7 @@
 #         name = "traj_marker"
 #         self_collisions = 0
 #     disable_gravity = True
-#     height_offset = 0.05   # 可选：相对 base 的额外抬升高度
+#     height_offset = 0.05   # 相对 base 初始 z 的抬升高度
 # marker = MarkerCfg()
 
 import os
@@ -69,9 +70,7 @@ class LeggedRobot(BaseTask):
             self._traj_fail_dist = float(self.cfg.traj.fail_dist)
             self._traj_num_verts = int(self.cfg.traj.num_vertices)
             self._traj_dtheta_max = float(self.cfg.traj.dtheta_max)
-
-            # 任务观测 = S 个未来采样点的 (x, y) => 2*S
-            self.num_task_obs = 2 * self._num_traj_samples
+            self.num_task_obs = 2 * self._num_traj_samples  # 任务观测 (x,y)*S
         else:
             self.num_task_obs = 0
 
@@ -80,6 +79,9 @@ class LeggedRobot(BaseTask):
 
         # —— 新增：marker 高度偏移（默认 0.0，可在 cfg.marker.height_offset 配置）——
         self._marker_height_offset = float(getattr(getattr(self.cfg, "marker", object()), "height_offset", 0.0))
+
+        # 每个 env 的常数 marker z（在 _create_envs 中写入）
+        self._marker_z0 = None  # torch.tensor(num_envs, device=self.device) after _create_envs
 
         # 会调用 create_sim -> _create_envs
         super().__init__(self.cfg, sim_params, physics_engine, sim_device, headless)
@@ -335,12 +337,11 @@ class LeggedRobot(BaseTask):
         current_actor_obs = torch.clone(current_obs[:,:-3])
 
         if self.add_noise:
-            # 注意：只对 actor 的本体/动作部分加噪声；任务观测不加噪声
+            # 只对 actor 的本体/动作部分加噪声；任务观测不加噪声
             current_actor_obs = current_actor_obs + (2 * torch.rand_like(current_actor_obs) - 1) * self.noise_scale_vec[0:(9 + 2 * self.num_dof + self.num_actions + 15)]
 
         if self.enable_traj_task:
             task_obs_actor, task_obs_critic = self.compute_task_observations()
-            # 历史堆叠窗口大小已用 num_one_step_actor_obs（= proprio + task）
             self.obs_buf = torch.cat((self.obs_buf[:, self.num_one_step_actor_obs:], current_actor_obs, task_obs_actor), dim=-1)
             self.privileged_obs_buf = torch.cat((current_obs, task_obs_critic), dim=-1)
         else:
@@ -637,8 +638,8 @@ class LeggedRobot(BaseTask):
         self._traj_curr_target[env_ids] = self._traj_gen.calc_pos(env_ids, t0)
         self._traj_samples_buf[env_ids] = self._fetch_traj_samples(env_ids)
 
-        # —— 关键：marker 统一采用 base z + 可选偏移 ——
-        base_z = ars[env_ids, 0, 2].clone() + self._marker_height_offset
+        # z 使用固定常数：每个 env 独立的 marker_z0
+        marker_z = self._marker_z0[env_ids]
         quat_identity = torch.tensor([0, 0, 0, 1], dtype=torch.float, device=self.device).view(1, 4)
 
         # 采样点槽位：1..S
@@ -646,7 +647,7 @@ class LeggedRobot(BaseTask):
             pos = self._traj_samples_buf[env_ids, k, :].clone()
             ars[env_ids, 1 + k, 0] = pos[:, 0]            # x
             ars[env_ids, 1 + k, 1] = pos[:, 1]            # y
-            ars[env_ids, 1 + k, 2] = base_z               # z = base_z
+            ars[env_ids, 1 + k, 2] = marker_z             # z 固定
             ars[env_ids, 1 + k, 3:7] = quat_identity.repeat(len(env_ids), 1)
             ars[env_ids, 1 + k, 7:13] = 0.0
 
@@ -655,7 +656,7 @@ class LeggedRobot(BaseTask):
         tgt = self._traj_curr_target[env_ids].clone()
         ars[env_ids, slot, 0] = tgt[:, 0]
         ars[env_ids, slot, 1] = tgt[:, 1]
-        ars[env_ids, slot, 2] = base_z
+        ars[env_ids, slot, 2] = marker_z
         ars[env_ids, slot, 3:7] = quat_identity.repeat(len(env_ids), 1)
         ars[env_ids, slot, 7:13] = 0.0
 
@@ -668,16 +669,16 @@ class LeggedRobot(BaseTask):
         S = self._num_traj_samples
         ars = self.all_root_states.view(self.num_envs, self.num_actors_per_env, 13)
 
-        # x,y 来自轨迹；z 跟随“当前 base 高度 + 偏移”
-        base_z = (self.root_states[:, 2] + self._marker_height_offset).unsqueeze(1)
+        # x,y 来自轨迹；z 始终固定为每个 env 的 marker_z0
+        zcol = self._marker_z0.view(self.num_envs, 1)  # (N,1)
 
         # 批量更新采样点
         ars[:, 1:1+S, 0:2] = self._traj_samples_buf[:, :, 0:2]
-        ars[:, 1:1+S, 2]   = base_z.expand(-1, S)
+        ars[:, 1:1+S, 2]   = zcol.expand(-1, S)
 
         # 更新目标点
         ars[:, 1+S, 0:2] = self._traj_curr_target[:, 0:2]
-        ars[:, 1+S, 2]   = base_z.squeeze(1)
+        ars[:, 1+S, 2]   = self._marker_z0
 
         # 一次性写回
         self.gym.set_actor_root_state_tensor(self.sim, gymtorch.unwrap_tensor(self.all_root_states.reshape(-1, 13)))
@@ -819,7 +820,7 @@ class LeggedRobot(BaseTask):
                               +self.num_actions # actions
                               +3 )              # base_lin_vel
         if self.enable_traj_task:
-            actor_one_step_dim += self.num_task_obs  # 给 actor 堆叠用的任务观测
+            actor_one_step_dim += self.num_task_obs
         self.obs_buf = torch.zeros(self.num_envs, self.actor_history_length * self.num_one_step_actor_obs, device=self.device)
 
         # privileged obs（不堆叠）
@@ -980,6 +981,9 @@ class LeggedRobot(BaseTask):
             self.marker_handles = [[] for _ in range(self.num_envs)]
         self.default_rigid_body_mass = torch.zeros(self.num_bodies, dtype=torch.float, device=self.device)
 
+        # 准备 marker_z0 向量
+        self._marker_z0 = torch.zeros(self.num_envs, device=self.device)
+
         for i in range(self.num_envs):
             env = self.gym.create_env(self.sim, env_lower, env_upper, int(np.sqrt(self.num_envs)))
             self.envs.append(env)
@@ -1006,22 +1010,31 @@ class LeggedRobot(BaseTask):
 
             # markers（槽位 1..S+1）
             if self.enable_traj_task:
-                # —— 本版修改：用“机器人初始化位置”的 x,y，使第一帧视觉上与机器人完全重合 ——
+                # 第一帧与机器人初始化位置对齐（x,y），z 固定 = base_init_z + height_offset
                 base_z0 = float(pos[2] + self._marker_height_offset)
+                self._marker_z0[i] = base_z0
+
+                def _finalize_marker(handle):
+                    # 颜色：红色
+                    self.gym.set_rigid_body_color(env, handle, 0, gymapi.MESH_VISUAL, gymapi.Vec3(1.0, 0.0, 0.0))
+                    # 关闭一切碰撞
+                    shape_props = self.gym.get_actor_rigid_shape_properties(env, handle)
+                    for j in range(len(shape_props)):
+                        shape_props[j].filter = 0xFFFF
+                    self.gym.set_actor_rigid_shape_properties(env, handle, shape_props)
 
                 for k in range(self._num_traj_samples):  # 采样点
                     mpose = gymapi.Transform()
                     mpose.p = gymapi.Vec3(float(pos[0]), float(pos[1]), base_z0)
                     h = self.gym.create_actor(env, marker_asset, mpose, f"{self.cfg.marker.asset.name}_sample_{k}", i, 0, 0)
-                    # 设为红色（灰 → 红）
-                    self.gym.set_rigid_body_color(env, h, 0, gymapi.MESH_VISUAL, gymapi.Vec3(1.0, 0.0, 0.0))
+                    _finalize_marker(h)
                     self.marker_handles[i].append(h)
 
                 # 目标点
                 tpose = gymapi.Transform()
                 tpose.p = gymapi.Vec3(float(pos[0]), float(pos[1]), base_z0)
                 h = self.gym.create_actor(env, marker_asset, tpose, f"{self.cfg.marker.asset.name}_target", i, 0, 0)
-                self.gym.set_rigid_body_color(env, h, 0, gymapi.MESH_VISUAL, gymapi.Vec3(1.0, 0.0, 0.0))
+                _finalize_marker(h)
                 self.marker_handles[i].append(h)
 
         # 常用索引
