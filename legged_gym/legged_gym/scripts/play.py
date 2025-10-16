@@ -84,7 +84,7 @@ def play(args):
 
 if __name__ == '__main__':
     EXPORT_POLICY = False
-    RECORD_FRAMES = False
+    RECORD_FRAMES = True
     MOVE_CAMERA = False
     args = get_args()
     play(args)

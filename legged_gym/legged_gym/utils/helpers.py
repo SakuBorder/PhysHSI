@@ -27,18 +27,19 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #
 # Copyright (c) 2021 ETH Zurich, Nikita Rudin
-
-import os
-import copy
-import torch
-import numpy as np
-import random
 from isaacgym import gymapi
 from isaacgym import gymutil
+import os
+import copy
+
+import numpy as np
+import random
+
 import torch.nn.functional as F
 import onnxruntime as ort
-
 from legged_gym import LEGGED_GYM_ROOT_DIR, LEGGED_GYM_ENVS_DIR
+import torch
+
 
 def class_to_dict(obj) -> dict:
     if not  hasattr(obj,"__dict__"):

@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: Copyright (c) 2021 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-# 
+#
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions are met:
 #
@@ -27,21 +27,38 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #
 # Copyright (c) 2021 ETH Zurich, Nikita Rudin
-from legged_gym import LEGGED_GYM_ROOT_DIR
-import numpy as np
-import os
-from datetime import datetime
+# SPDX-FileCopyrightText: Copyright (c) 2021 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-License-Identifier: BSD-3-Clause
+
+# 诊断放最顶
+import sys, os
+print("DEBUG(before isaacgym):", "torch" in sys.modules)
 
 import isaacgym
+assert isaacgym
+
+from isaacgym import gymapi
+import os
+from datetime import datetime
+import numpy as np
+
+from legged_gym import LEGGED_GYM_ROOT_DIR
 from legged_gym.envs import *
 from legged_gym.utils import get_args, task_registry
-import torch
+import os
 
-def train(args, headless=False):
+def train(args, headless: bool = False):
+    # 构环境
     env, env_cfg = task_registry.make_env(name=args.task, args=args)
+    # 构算法 runner
     ppo_runner, train_cfg = task_registry.make_alg_runner(env=env, name=args.task, args=args)
-    ppo_runner.learn(num_learning_iterations=train_cfg.runner.max_iterations, init_at_random_ep_len=True)
+    # 开训练
+    ppo_runner.learn(
+        num_learning_iterations=train_cfg.runner.max_iterations,
+        init_at_random_ep_len=True,
+    )
 
 if __name__ == '__main__':
     args = get_args()
     train(args)
+
