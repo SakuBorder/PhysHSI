@@ -77,6 +77,13 @@ class LeggedRobot(BaseTask):
             self._traj_num_verts = int(self.cfg.traj.num_vertices)
             self._traj_dtheta_max = float(self.cfg.traj.dtheta_max)
         self.num_task_obs = int(self.cfg.env.num_task_obs)
+        self._enable_task_mask_obs = bool(getattr(self.cfg.env, "enable_task_mask_obs", False))
+        total_task_obs_dim = sum(int(self.task_obs_dim.get(name, 0)) for name in self.task_names)
+        if self._enable_task_mask_obs:
+            total_task_obs_dim += self.num_tasks
+        assert (
+            self.num_task_obs == total_task_obs_dim
+        ), "num_task_obs must match declared task observation dimensions and mask settings"
 
         # 单步 actor 观测 = 本体 + 任务
         self.num_one_step_actor_obs = self.num_one_step_proprio_obs + self.num_task_obs
@@ -422,10 +429,34 @@ class LeggedRobot(BaseTask):
         sit_obs = self._compute_sit_obs()
         carry_obs = self._compute_carry_obs()
         stand_obs = self._compute_stand_obs()
-        mask_float = self.task_mask.float()
 
-        task_chunks = [traj_obs, sit_obs, carry_obs, stand_obs, mask_float]
-        task_obs = torch.cat(task_chunks, dim=-1)
+        chunk_map = {
+            "traj": traj_obs,
+            "sitdown": sit_obs,
+            "carrybox": carry_obs,
+            "standup": stand_obs,
+        }
+
+        task_chunks = []
+        for name in self.task_names:
+            chunk = chunk_map.get(name)
+            if chunk is None:
+                dim = int(self.task_obs_dim.get(name, 0))
+                if dim <= 0:
+                    continue
+                chunk = torch.zeros(self.num_envs, dim, device=self.device, dtype=self.root_states.dtype)
+            if self._enable_task_mask_obs and chunk.shape[1] > 0:
+                mask = self.task_mask[:, self.task_name_to_id[name]].unsqueeze(-1).float()
+                chunk = chunk * mask
+            task_chunks.append(chunk)
+
+        if self._enable_task_mask_obs:
+            task_chunks.append(self.task_mask.float())
+
+        task_obs = torch.cat(task_chunks, dim=-1) if len(task_chunks) > 0 else torch.zeros(
+            self.num_envs, 0, device=self.device, dtype=self.root_states.dtype
+        )
+        self.traj_obs_buf = task_obs
         return task_obs, task_obs
 
     # ---------------- Sim creation ----------------

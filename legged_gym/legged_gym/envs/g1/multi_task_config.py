@@ -8,6 +8,8 @@ class G1MultiTaskCfg(LeggedRobotCfg):
         num_actions = 29
         num_dofs = 29
 
+        enable_task_mask_obs = True
+
         num_one_step_proprio_obs = 3 + 6 + num_dofs * 2 + num_actions + 3 * 5
 
         # 每个任务的观测长度：轨迹(20) + 坐下(6) + 搬箱(9) + 起立(5) + 任务mask(4)
