@@ -62,6 +62,8 @@ from .g1.loco_config import G1CfgPPO as G1LocoCfgPPO
 from .g1.traj import LeggedRobot as G1Traj
 from .g1.traj_config import G1Cfg as G1TrajCfg
 from .g1.traj_config import G1CfgPPO as G1TrajCfgPPO
+from .g1.multi_task import LeggedRobot as G1MultiTask
+from .g1.multi_task_config import G1MultiTaskCfg, G1MultiTaskCfgPPO
 
 task_registry.register( "carrybox", G1CarryBox, G1CarryBoxCfg(), G1CarryBoxCfgPPO() )
 task_registry.register( "carrybox_resume", G1CarryBox, G1CarryBoxResumeCfg(), G1CarryBoxResumeCfgPPO() )
@@ -72,3 +74,4 @@ task_registry.register( "styleloco_dinosaur", G1StyleLoco, G1StyleLocoDinosaurCf
 task_registry.register( "styleloco_highknee", G1StyleLoco, G1StyleLocoHighKneeCfg(), G1StyleLocoHighKneeCfgPPO() )
 task_registry.register( "loco", G1StyleLoco, G1LocoCfg(), G1LocoCfgPPO() )
 task_registry.register( "traj", G1Traj, G1TrajCfg(), G1TrajCfgPPO() )
+task_registry.register( "multitask", G1MultiTask, G1MultiTaskCfg(), G1MultiTaskCfgPPO() )
