@@ -76,6 +76,14 @@ class LeggedRobot(BaseTask):
             self._traj_fail_dist = float(self.cfg.traj.fail_dist)
             self._traj_num_verts = int(self.cfg.traj.num_vertices)
             self._traj_dtheta_max = float(self.cfg.traj.dtheta_max)
+        self.multi_task_cfg = getattr(self.cfg, "multi_task", None)
+        assert self.multi_task_cfg is not None, "multi_task config required"
+        self.task_names = list(self.multi_task_cfg.task_names)
+        self.task_name_to_id = {name: idx for idx, name in enumerate(self.task_names)}
+        self.num_tasks = len(self.task_names)
+        self.task_init_prob = torch.tensor(self.multi_task_cfg.task_init_prob, dtype=torch.float)
+        self.task_obs_dim = dict(self.multi_task_cfg.task_obs_dim)
+
         self.num_task_obs = int(self.cfg.env.num_task_obs)
         self._enable_task_mask_obs = bool(getattr(self.cfg.env, "enable_task_mask_obs", False))
         total_task_obs_dim = sum(int(self.task_obs_dim.get(name, 0)) for name in self.task_names)
@@ -88,18 +96,9 @@ class LeggedRobot(BaseTask):
         # 单步 actor 观测 = 本体 + 任务
         self.num_one_step_actor_obs = self.num_one_step_proprio_obs + self.num_task_obs
 
-        self.multi_task_cfg = getattr(self.cfg, "multi_task", None)
-        assert self.multi_task_cfg is not None, "multi_task config required"
-        self.task_names = list(self.multi_task_cfg.task_names)
-        self.task_name_to_id = {name: idx for idx, name in enumerate(self.task_names)}
-        self.num_tasks = len(self.task_names)
-        self.task_init_prob = torch.tensor(self.multi_task_cfg.task_init_prob, dtype=torch.float)
-        self.task_obs_dim = dict(self.multi_task_cfg.task_obs_dim)
-
         self._sit_cfg = getattr(self.multi_task_cfg, "sitdown")
         self._carry_cfg = getattr(self.multi_task_cfg, "carrybox")
         self._stand_cfg = getattr(self.multi_task_cfg, "standup")
-        self._sit_target_quat = torch.zeros(self.num_envs, 4, device=self.device)
 
         # —— 新增：marker 高度偏移（默认 0.0，可在 cfg.marker.height_offset 配置）——
         self._marker_height_offset = float(getattr(getattr(self.cfg, "marker", object()), "height_offset", 0.0))
@@ -115,6 +114,7 @@ class LeggedRobot(BaseTask):
         self.task_indicator = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.task_mask = torch.zeros(self.num_envs, self.num_tasks, dtype=torch.bool, device=self.device)
 
+        self._sit_target_quat = torch.zeros(self.num_envs, 4, device=self.device)
         self._sit_target_pos = torch.zeros(self.num_envs, 3, device=self.device)
         self._sit_target_facing = torch.zeros(self.num_envs, 2, device=self.device)
         self._sit_target_height = torch.zeros(self.num_envs, 1, device=self.device)
