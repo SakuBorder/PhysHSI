@@ -34,7 +34,13 @@ from legged_gym import LEGGED_GYM_ROOT_DIR
 from legged_gym.utils.terrain import Terrain
 from legged_gym.utils.math import wrap_to_pi
 from legged_gym.utils.helpers import class_to_dict
-from legged_gym.utils.torch_utils import calc_heading_quat_inv, quat_to_tan_norm, euler_from_quaternion, torch_rand_float
+from legged_gym.utils.torch_utils import (
+    calc_heading_quat_inv,
+    quat_to_tan_norm,
+    euler_from_quaternion,
+    quat_from_angle_axis,
+    torch_rand_float,
+)
 from legged_gym.utils import traj_generator
 
 from legged_gym.envs.base.base_task import BaseTask
@@ -86,6 +92,7 @@ class LeggedRobot(BaseTask):
         self._sit_cfg = getattr(self.multi_task_cfg, "sitdown")
         self._carry_cfg = getattr(self.multi_task_cfg, "carrybox")
         self._stand_cfg = getattr(self.multi_task_cfg, "standup")
+        self._sit_target_quat = torch.zeros(self.num_envs, 4, device=self.device)
 
         # —— 新增：marker 高度偏移（默认 0.0，可在 cfg.marker.height_offset 配置）——
         self._marker_height_offset = float(getattr(getattr(self.cfg, "marker", object()), "height_offset", 0.0))
@@ -107,9 +114,12 @@ class LeggedRobot(BaseTask):
 
         self._carry_box_pos = torch.zeros(self.num_envs, 3, device=self.device)
         self._carry_box_goal = torch.zeros(self.num_envs, 3, device=self.device)
+        self._carry_box_rot = torch.zeros(self.num_envs, 4, device=self.device)
+        self._carry_box_start = torch.zeros(self.num_envs, 3, device=self.device)
 
         self._stand_target_height = torch.full((self.num_envs, 1), float(self._stand_cfg.target_height), device=self.device)
         self._stand_up_dir = torch.tensor([[0.0, 0.0, 1.0]], device=self.device).repeat(self.num_envs, 1)
+        self._stand_marker_pos = torch.zeros(self.num_envs, 3, device=self.device)
 
         if not self.headless:
             self.set_camera(self.cfg.viewer.pos, self.cfg.viewer.lookat)
@@ -223,6 +233,7 @@ class LeggedRobot(BaseTask):
         self.feet_pos[:] = self.rigid_body_states[:, self.feet_indices, 0:3]
         self.feet_quat[:] = self.rigid_body_states[:, self.feet_indices, 3:7]
         self.feet_vel[:] = self.rigid_body_states[:, self.feet_indices, 7:10]
+        self.pelvis_contact_pos = self.rigid_body_states[:, self.pelvis_contact_index, :3]
 
         if self.enable_traj_task:
             self._update_traj_target()
@@ -745,6 +756,9 @@ class LeggedRobot(BaseTask):
         self._sit_target_facing[env_ids, 0] = torch.cos(facing_angle)
         self._sit_target_facing[env_ids, 1] = torch.sin(facing_angle)
         self._sit_target_height[env_ids, 0] = target_z.squeeze(-1)
+        sit_axis = torch.zeros(env_ids.numel(), 3, device=self.device)
+        sit_axis[:, 2] = 1.0
+        self._sit_target_quat[env_ids] = quat_from_angle_axis(facing_angle, sit_axis)
 
     def _reset_carry_targets(self, env_ids):
         if env_ids.numel() == 0:
@@ -764,11 +778,20 @@ class LeggedRobot(BaseTask):
         goal_xy = box_xy + torch.cat([torch.cos(goal_heading), torch.sin(goal_heading)], dim=-1) * goal_dist
         self._carry_box_goal[env_ids, 0:2] = goal_xy
         self._carry_box_goal[env_ids, 2:3] = box_z
+        carry_axis = torch.zeros(env_ids.numel(), 3, device=self.device)
+        carry_axis[:, 2] = 1.0
+        self._carry_box_rot[env_ids] = quat_from_angle_axis(heading.squeeze(-1), carry_axis)
+        self._carry_box_start[env_ids] = self._carry_box_pos[env_ids]
 
     def _reset_stand_targets(self, env_ids):
         if env_ids.numel() == 0:
             return
         self._stand_target_height[env_ids, 0] = float(self._stand_cfg.target_height)
+        marker_offset = torch.zeros((env_ids.numel(), 2), device=self.device)
+        marker_offset[:, 0] = torch_rand_float(0.8, 1.5, (env_ids.numel(),), device=self.device)
+        marker_offset[:, 1] = torch_rand_float(-0.5, 0.5, (env_ids.numel(),), device=self.device)
+        self._stand_marker_pos[env_ids, 0:2] = self.root_states[env_ids, 0:2] + marker_offset
+        self._stand_marker_pos[env_ids, 2] = self._stand_target_height[env_ids, 0]
 
     def _compute_sit_obs(self):
         delta = self._sit_target_pos - self.root_states[:, 0:3]
@@ -859,6 +882,7 @@ class LeggedRobot(BaseTask):
         self.feet_vel  = self.rigid_body_states[:, self.feet_indices, 7:10]
         self.left_feet_pos  = self.rigid_body_states[:, self.left_feet_indices, 0:3]
         self.right_feet_pos = self.rigid_body_states[:, self.right_feet_indices, 0:3]
+        self.pelvis_contact_pos = self.rigid_body_states[:, self.pelvis_contact_index, :3]
 
         self.common_step_counter = 0
         self.extras = {}
@@ -1177,6 +1201,9 @@ class LeggedRobot(BaseTask):
         hand_colli_indices = [self.gym.find_actor_rigid_body_handle(self.envs[0], self.actor_handles[0], n) for n in hand_colli_names]
         self.hand_colli_indices = torch.tensor(hand_colli_indices, dtype=torch.long, device=self.device)
         self.head_index = self.gym.find_actor_rigid_body_handle(self.envs[0], self.actor_handles[0], self.cfg.asset.head_name)
+        self.pelvis_contact_index = self.gym.find_actor_rigid_body_handle(
+            self.envs[0], self.actor_handles[0], self.cfg.asset.pelvis_contact_name
+        )
 
         self.feet_indices = torch.tensor([self.gym.find_actor_rigid_body_handle(self.envs[0], self.actor_handles[0], n) for n in feet_names], dtype=torch.long, device=self.device)
         self.left_feet_indices  = torch.tensor([self.gym.find_actor_rigid_body_handle(self.envs[0], self.actor_handles[0], n) for n in left_foot_names], dtype=torch.long, device=self.device)
@@ -1261,6 +1288,274 @@ class LeggedRobot(BaseTask):
             return torch.zeros(self.num_envs, dtype=torch.float, device=self.device)
         root_pos = self.root_states[:, 0:3]
         return compute_traj_reward(root_pos, self._traj_curr_target)
+
+    def _reward_loco_task(self):
+        sit_idx = self.task_name_to_id.get("sitdown", None)
+        if sit_idx is None:
+            return torch.zeros(self.num_envs, device=self.device)
+        mask = self.task_mask[:, sit_idx]
+        if not torch.any(mask):
+            return torch.zeros(self.num_envs, device=self.device)
+
+        chair_pos = self._sit_target_pos
+        robot2chair_dir = chair_pos[:, :2] - self.root_states[:, :2]
+        robot2chair_dist_xy = torch.norm(robot2chair_dir, dim=-1)
+        robot2chair_dir = normalize(robot2chair_dir)
+        global_lin_vel = self.rigid_body_states[:, self.upper_body_index, 7:10]
+        robot2chair_vel = torch.sum(robot2chair_dir * global_lin_vel[:, :2], dim=-1)
+        robot2chair_vel_reward = torch.exp(-5 * torch.square(self.cfg.rewards.target_speed_loco - robot2chair_vel))
+
+        forward = quat_apply(self.base_quat, self.forward_vec)
+        heading = torch.atan2(forward[:, 1], forward[:, 0])
+        target_heading = torch.atan2(
+            chair_pos[:, 1] - self.root_states[:, 1],
+            chair_pos[:, 0] - self.root_states[:, 0],
+        )
+        yaw_error = torch.abs(wrap_to_pi(target_heading - heading))
+        loco_heading_reward = torch.exp(-0.75 * yaw_error)
+
+        loco_reward = (
+            self.cfg.rewards.robot2chair_vel * robot2chair_vel_reward
+            + self.cfg.rewards.loco_heading * loco_heading_reward
+        )
+
+        thresh = float(self.cfg.rewards.thresh_robot2chair)
+        loco_reward[robot2chair_dist_xy < thresh] = (
+            self.cfg.rewards.robot2chair_vel + self.cfg.rewards.loco_heading
+        )
+
+        return loco_reward * mask.float()
+
+    def _reward_sitDown_task(self):
+        sit_idx = self.task_name_to_id.get("sitdown", None)
+        if sit_idx is None:
+            return torch.zeros(self.num_envs, device=self.device)
+        mask = self.task_mask[:, sit_idx]
+        if not torch.any(mask):
+            return torch.zeros(self.num_envs, device=self.device)
+
+        chair_pos = self._sit_target_pos
+        chair_quat = self._sit_target_quat
+        robot2chair_dir = chair_pos[:, :2] - self.root_states[:, :2]
+        robot2chair_dist_xy = torch.norm(robot2chair_dir, dim=-1)
+
+        sit_pos_far_reward = 1.0 - robot2chair_dist_xy / float(self.cfg.rewards.thresh_robot2chair)
+        sit_pos_far_reward = torch.clamp(sit_pos_far_reward, min=0.0)
+        sit_pos_far_reward[robot2chair_dist_xy < 0.3] = 1.0
+
+        contact2chair_dist = torch.norm(self.pelvis_contact_pos - chair_pos, dim=-1)
+        sit_pos_near_reward = torch.exp(-3 * contact2chair_dist)
+
+        sit_height_error = torch.abs(chair_pos[:, 2] - self.pelvis_contact_pos[:, 2])
+        sit_height_reward = torch.exp(-5.0 * sit_height_error)
+        sit_height_reward[robot2chair_dist_xy > 0.3] = 0.0
+
+        robot_forward = quat_apply(self.base_quat, self.forward_vec)
+        robot_heading = torch.atan2(robot_forward[:, 1], robot_forward[:, 0])
+        chair_forward = quat_apply(chair_quat, self.forward_vec)
+        chair_heading = torch.atan2(chair_forward[:, 1], chair_forward[:, 0])
+        yaw_error = torch.abs(wrap_to_pi(robot_heading - chair_heading))
+        sit_heading_reward = torch.exp(-0.75 * yaw_error)
+
+        sit_reward = (
+            self.cfg.rewards.sit_pos_far * sit_pos_far_reward
+            + self.cfg.rewards.sit_pos_near * sit_pos_near_reward
+            + self.cfg.rewards.sit_height * sit_height_reward
+            + self.cfg.rewards.sit_heading * sit_heading_reward
+        )
+        sit_reward[robot2chair_dist_xy > float(self.cfg.rewards.thresh_robot2chair)] = 0.0
+
+        return sit_reward * mask.float()
+
+    def _reward_walk_task(self):
+        carry_idx = self.task_name_to_id.get("carrybox", None)
+        if carry_idx is None:
+            return torch.zeros(self.num_envs, device=self.device)
+        mask = self.task_mask[:, carry_idx]
+        if not torch.any(mask):
+            return torch.zeros(self.num_envs, device=self.device)
+
+        box_pos = self._carry_box_pos
+        robot_pos = self.root_states[:, :3]
+        robot2object_vec = box_pos[:, :2] - robot_pos[:, :2]
+        robot2object_dist = torch.norm(robot2object_vec, dim=-1)
+        robot2object_dir = normalize(robot2object_vec)
+
+        global_lin_vel = self.rigid_body_states[:, self.upper_body_index, 7:10]
+        robot2object_vel = torch.sum(robot2object_dir * global_lin_vel[:, :2], dim=-1)
+        robot2object_vel_reward = torch.exp(-5 * torch.square(self.cfg.rewards.target_speed_loco - robot2object_vel))
+
+        robot_forward = quat_apply(self.base_quat, self.forward_vec)
+        heading = torch.atan2(robot_forward[:, 1], robot_forward[:, 0])
+        target_heading = torch.atan2(
+            box_pos[:, 1] - robot_pos[:, 1], box_pos[:, 0] - robot_pos[:, 0]
+        )
+        yaw_error = torch.abs(wrap_to_pi(target_heading - heading))
+        start_heading_reward = torch.exp(-0.75 * yaw_error)
+
+        robot2object_pos_reward = torch.exp(-0.5 * robot2object_dist)
+
+        walk_reward = (
+            self.cfg.rewards.robot2object_pos * robot2object_pos_reward
+            + self.cfg.rewards.robot2object_vel * robot2object_vel_reward
+            + self.cfg.rewards.start_heading * start_heading_reward
+        )
+
+        thresh_object = float(self.cfg.rewards.thresh_robot2object)
+        walk_reward[robot2object_dist < thresh_object] = (
+            self.cfg.rewards.robot2object_pos
+            + self.cfg.rewards.robot2object_vel
+            + self.cfg.rewards.start_heading
+        )
+
+        object2goal_dist = torch.norm(self._carry_box_goal - box_pos, dim=-1)
+        walk_reward[object2goal_dist < float(self.cfg.rewards.thresh_object2goal)] = (
+            self.cfg.rewards.robot2object_pos
+            + self.cfg.rewards.robot2object_vel
+            + self.cfg.rewards.start_heading
+        )
+
+        return walk_reward * mask.float()
+
+    def _reward_carryup_task(self):
+        carry_idx = self.task_name_to_id.get("carrybox", None)
+        if carry_idx is None:
+            return torch.zeros(self.num_envs, device=self.device)
+        mask = self.task_mask[:, carry_idx]
+        if not torch.any(mask):
+            return torch.zeros(self.num_envs, device=self.device)
+
+        box_pos = self._carry_box_pos
+        goal_pos = self._carry_box_goal
+        hand_pos = self.rigid_body_states[:, self.hand_pos_indices, :3]
+        hand2object_err = torch.sum((hand_pos.mean(dim=1) - box_pos) ** 2, dim=-1)
+        hand2object_reward = torch.exp(-3 * hand2object_err)
+
+        box_carryup_reward = torch.exp(
+            -3 * torch.clamp(self.cfg.rewards.target_box_height - box_pos[:, 2], min=0)
+        )
+        box_carryup_reward[box_pos[:, 2] > self.cfg.rewards.target_box_height] = 1.0
+        object2goal_dist = torch.norm(goal_pos - box_pos, dim=-1)
+        box_carryup_reward[object2goal_dist < float(self.cfg.rewards.thresh_object2goal)] = 1.0
+
+        carryup_reward = (
+            self.cfg.rewards.hand_pos * hand2object_reward
+            + self.cfg.rewards.box_height * box_carryup_reward
+        )
+
+        robot2object_dist = torch.norm(box_pos[:, :2] - self.root_states[:, :2], dim=-1)
+        carryup_reward[robot2object_dist > float(self.cfg.rewards.thresh_robot2object)] = 0.0
+        carryup_reward[object2goal_dist < float(self.cfg.rewards.thresh_object2goal)] = (
+            self.cfg.rewards.hand_pos + self.cfg.rewards.box_height
+        )
+
+        return carryup_reward * mask.float()
+
+    def _reward_relocation_task(self):
+        carry_idx = self.task_name_to_id.get("carrybox", None)
+        if carry_idx is None:
+            return torch.zeros(self.num_envs, device=self.device)
+        mask = self.task_mask[:, carry_idx]
+        if not torch.any(mask):
+            return torch.zeros(self.num_envs, device=self.device)
+
+        box_pos = self._carry_box_pos
+        goal_pos = self._carry_box_goal
+        robot_pos = self.root_states[:, :3]
+
+        robot_forward = quat_apply(self.base_quat, self.forward_vec)
+        heading = torch.atan2(robot_forward[:, 1], robot_forward[:, 0])
+        target_heading = torch.atan2(
+            goal_pos[:, 1] - robot_pos[:, 1], goal_pos[:, 0] - robot_pos[:, 0]
+        )
+        yaw_error = torch.abs(wrap_to_pi(target_heading - heading))
+        relocation_heading_reward = torch.exp(-0.75 * yaw_error)
+
+        heading_error = 0.5 * wrap_to_pi(target_heading - heading)
+        ang_command = torch.clip(heading_error, -1.0, 1.0)
+        ang_vel_error = torch.square(ang_command - self.base_ang_vel[:, 2])
+        relocation_heading_vel_reward = torch.exp(-ang_vel_error / self.cfg.rewards.tracking_sigma)
+
+        robot2goal_vec = goal_pos[:, :2] - robot_pos[:, :2]
+        robot2goal_dir = normalize(robot2goal_vec)
+        robot2goal_dist = torch.norm(robot2goal_vec, dim=-1)
+        robot2goal_pos_reward = torch.exp(-0.5 * robot2goal_dist)
+        global_lin_vel = self.rigid_body_states[:, self.upper_body_index, 7:10]
+        robot2goal_vel = torch.sum(robot2goal_dir * global_lin_vel[:, :2], dim=-1)
+        robot2goal_vel_reward = torch.exp(-5 * torch.square(self.cfg.rewards.target_speed_carry - robot2goal_vel))
+
+        object2goal_vec = goal_pos - box_pos
+        object2goal_dist = torch.norm(object2goal_vec, dim=-1)
+        object2goal_pos_reward = torch.exp(-10.0 * object2goal_dist)
+
+        robot2goal_pos_reward[robot2goal_dist < float(self.cfg.rewards.thresh_robot2goal)] = 1.0
+        robot2goal_vel_reward[robot2goal_dist < float(self.cfg.rewards.thresh_robot2goal)] = 1.0
+
+        put_box_reward = torch.exp(-3.0 * torch.abs(box_pos[:, 2] - goal_pos[:, 2]))
+        object2goal_dist_xy = torch.norm(object2goal_vec[:, :2], dim=-1)
+        put_box_reward[object2goal_dist_xy > 0.6] = 0.0
+
+        relocation_reward = (
+            self.cfg.rewards.relocation_heading * relocation_heading_reward
+            + self.cfg.rewards.relocation_heading_vel * relocation_heading_vel_reward
+            + self.cfg.rewards.robot2goal_pos * robot2goal_pos_reward
+            + self.cfg.rewards.robot2goal_vel * robot2goal_vel_reward
+            + self.cfg.rewards.object2goal_pos * object2goal_pos_reward
+            + self.cfg.rewards.put_box * put_box_reward
+        )
+
+        lift_height = box_pos[:, 2] - self._carry_box_start[:, 2]
+        is_stage_relocation = (lift_height > 0.05) | (
+            torch.norm(box_pos[:, :2] - self._carry_box_start[:, :2], dim=-1)
+            > float(self.cfg.rewards.thresh_object2start)
+        )
+        relocation_reward[~is_stage_relocation] = 0.0
+        relocation_reward[object2goal_dist < float(self.cfg.rewards.thresh_object2goal)] = (
+            self.cfg.rewards.relocation_heading
+            + self.cfg.rewards.relocation_heading_vel
+            + self.cfg.rewards.robot2goal_pos
+            + self.cfg.rewards.robot2goal_vel
+            + self.cfg.rewards.object2goal_pos
+            + self.cfg.rewards.put_box
+        )
+
+        return relocation_reward * mask.float()
+
+    def _reward_standup_task(self):
+        stand_idx = self.task_name_to_id.get("standup", None)
+        if stand_idx is None:
+            return torch.zeros(self.num_envs, device=self.device)
+        mask = self.task_mask[:, stand_idx]
+        if not torch.any(mask):
+            return torch.zeros(self.num_envs, device=self.device)
+
+        base_height = self.root_states[:, 2]
+        height_error = torch.clamp(self._stand_target_height[:, 0] - base_height, min=0.0)
+        stand_reward = torch.exp(-5.0 * height_error)
+        stand_reward[height_error <= 0.0] = 1.0
+
+        head_height = self.rigid_body_states[:, self.head_index, 2]
+        head_height_error = torch.abs(head_height - (self._stand_target_height[:, 0] + 0.2))
+        head_reward = torch.exp(-2 * head_height_error)
+        head_reward[head_height > self._stand_target_height[:, 0] + 0.2] = 1.0
+
+        stand_reward = (
+            self.cfg.rewards.base_height * stand_reward
+            + self.cfg.rewards.head_height * head_reward
+        )
+
+        robot2marker = torch.norm(self._stand_marker_pos[:, :2] - self.root_states[:, :2], dim=-1)
+        near_reward = torch.exp(-2 * robot2marker)
+        stand_reward += (
+            self.cfg.rewards.stand_still
+            * torch.exp(-0.3 * torch.sum(torch.abs(self.dof_pos - self.default_dof_pos), dim=1))
+        )
+        stand_reward += self.cfg.rewards.hand_free * torch.mean(
+            1.0 * (torch.norm(self.contact_forces[:, self.hand_colli_indices], dim=-1) < 1.0), dim=1
+        )
+        stand_reward += self.cfg.rewards.pos_near * near_reward
+
+        return stand_reward * mask.float()
 
     def _reward_tracking_yaw(self):
         rew = torch.exp(-torch.abs(self.commands[:,2] - self.yaw[:,0]))

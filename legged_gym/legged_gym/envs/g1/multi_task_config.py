@@ -87,6 +87,59 @@ class G1MultiTaskCfg(LeggedRobotCfg):
             target_height = 0.95
             up_tolerance = 0.2
 
+    class rewards(LeggedRobotCfg.rewards):
+        class scales(LeggedRobotCfg.rewards.scales):
+            dof_acc = -1e-7
+            action_rate = -0.03
+            torques = -1e-4
+            dof_vel = -2e-4
+            dof_pos_limits = -5.0
+            dof_vel_limits = -1e-3
+            torque_limits = -0.03
+
+            loco_task = 1.0
+            sitDown_task = 1.0
+            walk_task = 1.0
+            carryup_task = 1.0
+            relocation_task = 1.0
+            standup_task = 3.0
+
+        # sitdown
+        robot2chair_vel = 1.0
+        loco_heading = 1.0
+        sit_pos_far = 1.0
+        sit_pos_near = 1.0
+        sit_height = 1.0
+        sit_heading = 1.0
+        target_speed_loco = 0.85
+        thresh_robot2chair = 0.7
+
+        # carrybox
+        robot2object_pos = 0.0
+        robot2object_vel = 1.0
+        start_heading = 0.5
+        hand_pos = 0.7
+        box_height = 2.0
+        relocation_heading = 0.5
+        relocation_heading_vel = 0.0
+        robot2goal_pos = 0.0
+        robot2goal_vel = 1.0
+        object2goal_pos = 1.0
+        put_box = 1.0
+        target_speed_carry = 0.85
+        target_box_height = 0.72
+        thresh_robot2object = 0.7
+        thresh_robot2goal = 0.65
+        thresh_object2goal = 0.05
+        thresh_object2start = 0.5
+
+        # standup
+        base_height = 0.0
+        head_height = 0.5
+        stand_still = 1.0
+        hand_free = 0.5
+        pos_near = 0.2
+
     class init_state(LeggedRobotCfg.init_state):
         pos = [2.3, 0.0, 0.8]
         rot = [0.0, 0.0, 1.0, 0.0]
