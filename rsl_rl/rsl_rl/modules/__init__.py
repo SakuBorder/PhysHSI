@@ -30,4 +30,5 @@
 
 
 from .actor_critic import ActorCritic
+from .actor_critic_transformer import TransformerActorCritic
 from .amp import AMP

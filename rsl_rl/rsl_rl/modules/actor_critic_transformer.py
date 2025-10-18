@@ -44,16 +44,13 @@ class TransformerActorCritic(nn.Module):
         self,
         num_actor_obs,
         num_critic_obs,
-        num_actions,
-        history_lengths,
-        add_action,
-        net_type,
-        device="cpu",
+        actor_history_length,
+        num_actions=19,
         actor_hidden_dims=[256, 256, 256],
         critic_hidden_dims=[256, 256, 256],
         activation="elu",
-        num_privileged_obs=187,
         init_noise_std=1.0,
+        device="cpu",
         # Multi-task parameters
         self_obs_size=None,
         task_obs_size=None,
@@ -70,42 +67,54 @@ class TransformerActorCritic(nn.Module):
 
         activation = get_activation(activation)
 
-        self.short_history_length = history_lengths[0]
-        self.long_history_length = history_lengths[1]
+        self.actor_history_length = actor_history_length
+        self.long_history_length = actor_history_length
         self.obs_dim = num_actor_obs
         self.action_dim = num_actions
 
-        self.add_action = add_action
-        self.net_type = net_type
         self.device = device
 
         # Multi-task support
-        self.enable_multi_task = multi_task_info is not None
-        
+        self.enable_multi_task = multi_task_info is not None and transformer_params is not None
+
         if self.enable_multi_task:
-            self.self_obs_size = self_obs_size if self_obs_size is not None else num_actor_obs
-            self.task_obs_size = task_obs_size if task_obs_size is not None else 0
-            
-            # Multi-task configuration
+            inferred_task_obs = task_obs_size if task_obs_size is not None else 0
+            inferred_self_obs = self_obs_size if self_obs_size is not None else max(
+                num_actor_obs - inferred_task_obs, 0
+            )
+            self.self_obs_size = int(inferred_self_obs)
+            self.task_obs_size = int(task_obs_size if task_obs_size is not None else inferred_task_obs)
+            self.step_obs_dim = self.self_obs_size + self.task_obs_size
+
             self.multi_task_info = multi_task_info
-            assert self.multi_task_info["enable_task_mask_obs"] is True
-            
-            # Create pre-defined task obs mask matrix
-            self.task_obs_onehot_size = self.multi_task_info["onehot_size"]  # equal to num_tasks
-            self.task_obs_tota_size = self.multi_task_info["tota_subtask_obs_size"]
-            self.task_obs_each_size = self.multi_task_info["each_subtask_obs_size"]
-            self.task_obs_each_indx = self.multi_task_info["each_subtask_obs_indx"]
-            self.each_subtask_names = self.multi_task_info["each_subtask_name"]
-            
+            if not self.multi_task_info.get("enable_task_mask_obs", False):
+                raise AssertionError("Multi-task transformer requires task mask observations")
+
+            self.task_obs_onehot_size = int(self.multi_task_info["onehot_size"])
+            self.task_obs_tota_size = int(self.multi_task_info["tota_subtask_obs_size"])
+
+            raw_sizes = self.multi_task_info["each_subtask_obs_size"]
+            if isinstance(raw_sizes, torch.Tensor):
+                raw_sizes = raw_sizes.cpu().tolist()
+            self.task_obs_each_size = [int(s) for s in raw_sizes]
+
+            raw_indices = self.multi_task_info["each_subtask_obs_indx"]
+            if isinstance(raw_indices, torch.Tensor):
+                raw_indices = raw_indices.cpu().tolist()
+            self.task_obs_each_indx = [int(idx) for idx in raw_indices]
+
+            self.each_subtask_names = list(self.multi_task_info["each_subtask_name"])
+
+            if not self.task_obs_each_indx or self.task_obs_each_indx[-1] != self.task_obs_tota_size:
+                raise AssertionError("Task observation metadata inconsistent with total size")
+
             print(f"Multi-task enabled with {self.task_obs_onehot_size} tasks")
             print(f"Task names: {self.each_subtask_names}")
         else:
             self.self_obs_size = num_actor_obs
             self.task_obs_size = 0
+            self.step_obs_dim = self.self_obs_size
 
-        mlp_input_dim_a = self.obs_dim * self.short_history_length + 64 * (
-            self.long_history_length > 0
-        )
         mlp_input_dim_c = self.obs_dim
 
         # Policy - choose between Decision Transformer or Multi-task Transformer
@@ -149,11 +158,14 @@ class TransformerActorCritic(nn.Module):
 
     def _build_multitask_transformer_actor(self, transformer_params, num_actions, activation):
         """Build multi-task transformer actor following file 2's architecture"""
-        
+
         num_features = transformer_params.get("num_features", 64)
         num_tokens = 1 + len(self.task_obs_each_size) + 1  # weight + self + multiple tasks
         drop_ratio = transformer_params.get("drop_ratio", 0.0)
         tokenizer_units = transformer_params.get("tokenizer_units", [256, 128])
+
+        self.token_feature_dim = num_features
+        self.transformer_num_tokens = num_tokens
         
         print("Building tokenizer for self obs")
         self.self_encoder = self._build_mlp(
@@ -232,54 +244,64 @@ class TransformerActorCritic(nn.Module):
         
         return nn.Sequential(*layers)
 
+    def _prepare_latest_observation(self, obs):
+        if obs.dim() == 3:
+            obs = obs[:, -1, :]
+        if obs.shape[-1] > self.step_obs_dim:
+            obs = obs[..., -self.step_obs_dim:]
+        return obs
+
     def _eval_multitask_transformer(self, obs):
-        """Evaluate multi-task transformer following file 2's logic"""
+        """Evaluate multi-task transformer by tokenizing self and task observations."""
+
+        obs = self._prepare_latest_observation(obs)
         B = obs.shape[0]
-        
-        # Split observations
+
+        # Split observations into proprioceptive and task-specific components
         self_obs = obs[..., :self.self_obs_size]
         self_token = self.self_encoder(self_obs).unsqueeze(1)  # (B, 1, num_feats)
-        
+
         task_obs = obs[..., self.self_obs_size:]
-        task_obs_real = task_obs[..., :self.task_obs_tota_size]  # exclude onehot code
-        
-        # Process each task
-        task_token = torch.stack([
-            self.task_encoder[i](
-                task_obs_real[:, self.task_obs_each_indx[i]:self.task_obs_each_indx[i + 1]]
-            ) 
-            for i in range(self.task_obs_onehot_size)
-        ], dim=1)
-        
+        task_obs_real = task_obs[..., :self.task_obs_tota_size] if self.task_obs_tota_size > 0 else task_obs.new_zeros((B, 0))
+
+        if self.task_obs_onehot_size > 0:
+            tokens = []
+            for i in range(self.task_obs_onehot_size):
+                start, end = self.task_obs_each_indx[i], self.task_obs_each_indx[i + 1]
+                tokens.append(self.task_encoder[i](task_obs_real[:, start:end]))
+            task_token = torch.stack(tokens, dim=1)
+        else:
+            task_token = task_obs_real.new_zeros((B, 0, self.token_feature_dim))
+
         # Expand weight token
         weight_token = self.weight_token.expand(B, -1, -1)
-        
+
         # Concatenate all tokens
         x = torch.cat((weight_token, self_token, task_token), dim=1)  # [B, num_tokens, num_feats]
-        
+
         # Add positional embedding
         if self.use_pos_embed:
             x = self.pos_drop(x + self.pos_embed)
-        
-        # Compute key padding mask
+
+        # Compute key padding mask (True for padding positions)
         src_key_padding_mask = torch.ones((B, x.shape[1]), dtype=torch.bool, device=x.device)
-        src_key_padding_mask[:, [0, 1]] = False  # weight and self tokens are always active
-        
-        # Active task mask
-        task_obs_onehot_idx = task_obs[..., self.task_obs_tota_size:].max(dim=-1)[1] + 2
-        task_obs_onehot_idx_mask = nn.functional.one_hot(
-            task_obs_onehot_idx, 
-            num_classes=self.task_obs_onehot_size + 2
-        ).bool()
-        
-        src_key_padding_mask[task_obs_onehot_idx_mask] = False
-        
+        src_key_padding_mask[:, :2] = False  # weight and self tokens are always active
+
+        if self.task_obs_onehot_size > 0:
+            task_mask = task_obs[..., self.task_obs_tota_size:]
+            task_obs_onehot_idx = task_mask.argmax(dim=-1) + 2
+            task_obs_onehot_idx_mask = nn.functional.one_hot(
+                task_obs_onehot_idx,
+                num_classes=self.task_obs_onehot_size + 2,
+            ).to(dtype=torch.bool)
+            src_key_padding_mask[task_obs_onehot_idx_mask] = False
+
         # Transformer encoding
         x = self.transformer_encoder(x, src_key_padding_mask=src_key_padding_mask)
-        
+
         # Output from weight token
         output = self.composer(x[:, 0])
-        
+
         return output
 
     @staticmethod
@@ -312,11 +334,7 @@ class TransformerActorCritic(nn.Module):
     def update_distribution(self, observations, cur_timestep=None):
         if self.enable_multi_task and self.actor is None:
             # Use multi-task transformer
-            if len(observations.shape) == 3:
-                # Handle history: use latest observation
-                mean = self._eval_multitask_transformer(observations[:, -1, :])
-            else:
-                mean = self._eval_multitask_transformer(observations)
+            mean = self._eval_multitask_transformer(observations)
         else:
             # Use decision transformer
             mean = self.actor(
@@ -334,11 +352,7 @@ class TransformerActorCritic(nn.Module):
     def act_inference(self, observations, cur_timestep=None):
         if self.enable_multi_task and self.actor is None:
             # Use multi-task transformer
-            if len(observations.shape) == 3:
-                # Handle history: use latest observation
-                actions_mean = self._eval_multitask_transformer(observations[:, -1, :])
-            else:
-                actions_mean = self._eval_multitask_transformer(observations)
+            actions_mean = self._eval_multitask_transformer(observations)
         else:
             # Use decision transformer
             actions_mean = self.actor(
@@ -353,13 +367,10 @@ class TransformerActorCritic(nn.Module):
     def eval_actor(self, obs, cur_timestep=None):
         """Evaluate actor - compatible with both modes"""
         if self.enable_multi_task and self.actor is None:
-            if len(obs.shape) == 3:
-                mu = self._eval_multitask_transformer(obs[:, -1, :])
-            else:
-                mu = self._eval_multitask_transformer(obs)
+            mu = self._eval_multitask_transformer(obs)
         else:
             mu = self.actor(cur_timestep, obs[:, :, :36], obs[:, :, 36:48])
-        
+
         sigma = self.std
         return mu, sigma
 

@@ -109,6 +109,9 @@ class LeggedRobot(BaseTask):
         # 会调用 create_sim -> _create_envs
         super().__init__(self.cfg, sim_params, physics_engine, sim_device, headless)
 
+        # Build metadata for multi-task observation organization
+        self._build_multi_task_metadata()
+
         self.task_init_prob = self.task_init_prob / torch.clamp(self.task_init_prob.sum(), min=1e-6)
         self.task_init_prob = self.task_init_prob.to(self.device)
         self.task_indicator = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
@@ -194,6 +197,36 @@ class LeggedRobot(BaseTask):
         self.gym.refresh_actor_root_state_tensor(self.sim)
         self.gym.refresh_rigid_body_state_tensor(self.sim)
         self.gym.refresh_net_contact_force_tensor(self.sim)
+
+    def _build_multi_task_metadata(self):
+        """Pre-compute indexing and mask info for multi-task observations."""
+
+        each_sizes = [int(self.task_obs_dim.get(name, 0)) for name in self.task_names]
+        cumulative = torch.tensor([0] + each_sizes, device=self.device, dtype=torch.long).cumsum(dim=0)
+        total_dim = int(cumulative[-1].item()) if len(cumulative) > 0 else 0
+
+        if total_dim > 0:
+            mask = torch.zeros(self.num_tasks, total_dim, device=self.device, dtype=torch.bool)
+            for idx in range(self.num_tasks):
+                start, end = cumulative[idx].item(), cumulative[idx + 1].item()
+                if end > start:
+                    mask[idx, start:end] = True
+        else:
+            mask = torch.zeros(self.num_tasks, 0, device=self.device, dtype=torch.bool)
+
+        self._each_subtask_obs_size = each_sizes
+        self._task_obs_indices = cumulative
+        self._task_obs_total_dim = total_dim
+        self._task_obs_mask = mask
+        self._multi_task_info = {
+            "onehot_size": self.num_tasks,
+            "tota_subtask_obs_size": total_dim,
+            "each_subtask_obs_size": each_sizes,
+            "each_subtask_obs_mask": mask,
+            "each_subtask_obs_indx": cumulative,
+            "enable_task_mask_obs": self._enable_task_mask_obs,
+            "each_subtask_name": self.task_names,
+        }
 
     # --------------- Observations / Rewards ---------------
     def compute_amp_observations(self):
@@ -422,9 +455,6 @@ class LeggedRobot(BaseTask):
             traj_samples = self._fetch_traj_samples()
             self._traj_samples_buf[:] = traj_samples
             traj_obs = compute_location_observations(self.root_states, traj_samples)
-            self.traj_obs_buf = traj_obs
-        else:
-            self.traj_obs_buf = traj_obs
 
         sit_obs = self._compute_sit_obs()
         carry_obs = self._compute_carry_obs()
@@ -439,25 +469,38 @@ class LeggedRobot(BaseTask):
 
         task_chunks = []
         for name in self.task_names:
+            dim = int(self.task_obs_dim.get(name, 0))
+            if dim <= 0:
+                continue
             chunk = chunk_map.get(name)
-            if chunk is None:
-                dim = int(self.task_obs_dim.get(name, 0))
-                if dim <= 0:
-                    continue
+            if chunk is None or chunk.shape[1] != dim:
                 chunk = torch.zeros(self.num_envs, dim, device=self.device, dtype=self.root_states.dtype)
-            if self._enable_task_mask_obs and chunk.shape[1] > 0:
-                mask = self.task_mask[:, self.task_name_to_id[name]].unsqueeze(-1).float()
-                chunk = chunk * mask
             task_chunks.append(chunk)
 
-        if self._enable_task_mask_obs:
-            task_chunks.append(self.task_mask.float())
+        if len(task_chunks) > 0:
+            task_obs_real = torch.cat(task_chunks, dim=-1)
+        else:
+            task_obs_real = torch.zeros(self.num_envs, 0, device=self.device, dtype=self.root_states.dtype)
 
-        task_obs = torch.cat(task_chunks, dim=-1) if len(task_chunks) > 0 else torch.zeros(
-            self.num_envs, 0, device=self.device, dtype=self.root_states.dtype
-        )
-        self.traj_obs_buf = task_obs
+        if self._enable_task_mask_obs and task_obs_real.numel() > 0 and self._task_obs_mask.numel() > 0:
+            mask = torch.matmul(
+                self.task_mask.to(dtype=task_obs_real.dtype),
+                self._task_obs_mask.to(dtype=task_obs_real.dtype),
+            )
+            task_obs_real = task_obs_real * mask
+
+        if self._enable_task_mask_obs:
+            task_obs = torch.cat((task_obs_real, self.task_mask.float()), dim=-1)
+        else:
+            task_obs = task_obs_real
+
+        self.traj_obs_buf = task_obs_real
         return task_obs, task_obs
+
+    def get_multi_task_info(self):
+        """Expose structured multi-task observation metadata for policy construction."""
+
+        return self._multi_task_info
 
     # ---------------- Sim creation ----------------
     def create_sim(self):
@@ -963,7 +1006,7 @@ class LeggedRobot(BaseTask):
                 self.end_effector_pos[:, 3*i:3*i+3])
 
         if self.enable_traj_task:
-            self.traj_obs_buf = torch.zeros(self.num_envs, self.num_task_obs, device=self.device)
+            self.traj_obs_buf = torch.zeros(self.num_envs, self._task_obs_total_dim, device=self.device)
             self._traj_curr_target = torch.zeros(self.num_envs, 3, device=self.device)
 
         # 默认关节与 PD
