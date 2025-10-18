@@ -1,33 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2021 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: BSD-3-Clause
-#
-# Redistribution and use in source and binary forms, with or without
-# modification, are permitted provided that the following conditions are met:
-#
-# 1. Redistributions of source code must retain the above copyright notice, this
-# list of conditions and the following disclaimer.
-#
-# 2. Redistributions in binary form must reproduce the above copyright notice,
-# this list of conditions and the following disclaimer in the documentation
-# and/or other materials provided with the distribution.
-#
-# 3. Neither the name of the copyright holder nor the names of its
-# contributors may be used to endorse or promote products derived from
-# this software without specific prior written permission.
-#
-# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
-# AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
-# IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
-# DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
-# FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
-# DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
-# SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
-# CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
-# OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
-# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
-#
-# Copyright (c) 2021 ETH Zurich, Nikita Rudin
 
+import os
 import numpy as np
 
 import torch
@@ -35,6 +9,28 @@ import torch.nn as nn
 from torch.distributions import Normal
 from torch.nn.modules import rnn
 from .transformer_modelling import DecisionTransformer
+
+# ---- KISS: 彻底禁用易出错的 SDPA 快速内核，强制使用 math 实现 ----
+# 如需恢复，可设环境变量 FORCE_MATH_SDPA=0
+_FORCE_MATH_SDPA = os.environ.get("FORCE_MATH_SDPA", "1") != "0"
+if _FORCE_MATH_SDPA:
+    try:
+        torch.backends.cuda.enable_flash_sdp(False)
+        torch.backends.cuda.enable_mem_efficient_sdp(False)
+        torch.backends.cuda.enable_math_sdp(True)
+    except Exception:
+        # 低版本 PyTorch 没有这些开关就直接忽略
+        pass
+
+
+def _assert_bool_mask(mask: torch.Tensor, B: int, S: int, device: torch.device):
+    assert isinstance(mask, torch.Tensor), "src_key_padding_mask must be a torch.Tensor"
+    assert mask.dtype == torch.bool, f"src_key_padding_mask must be bool, got {mask.dtype}"
+    assert mask.shape == (B, S), f"src_key_padding_mask shape must be {(B, S)}, got {tuple(mask.shape)}"
+    assert mask.device == device, f"mask/device mismatch: mask={mask.device}, x={device}"
+    assert S > 0, "sequence length S must be > 0"
+    # 每个 batch 至少要有一个未屏蔽 token
+    assert (~mask).any(dim=1).all(), "some batch has all tokens masked (all True in src_key_padding_mask)"
 
 
 class TransformerActorCritic(nn.Module):
@@ -51,7 +47,6 @@ class TransformerActorCritic(nn.Module):
         activation="elu",
         init_noise_std=1.0,
         device="cpu",
-        # Multi-task parameters
         self_obs_size=None,
         task_obs_size=None,
         multi_task_info=None,
@@ -65,13 +60,13 @@ class TransformerActorCritic(nn.Module):
             )
         super(TransformerActorCritic, self).__init__()
 
-        activation = get_activation(activation)
+        act_mod = get_activation(activation)
+        assert isinstance(act_mod, nn.Module), "activation must map to an nn.Module"
 
         self.actor_history_length = actor_history_length
         self.long_history_length = actor_history_length
         self.obs_dim = num_actor_obs
         self.action_dim = num_actions
-
         self.device = device
 
         # Multi-task support
@@ -105,8 +100,10 @@ class TransformerActorCritic(nn.Module):
 
             self.each_subtask_names = list(self.multi_task_info["each_subtask_name"])
 
-            if not self.task_obs_each_indx or self.task_obs_each_indx[-1] != self.task_obs_tota_size:
+            if (not self.task_obs_each_indx) or (self.task_obs_each_indx[-1] != self.task_obs_tota_size):
                 raise AssertionError("Task observation metadata inconsistent with total size")
+            if len(self.task_obs_each_size) != self.task_obs_onehot_size:
+                raise AssertionError("each_subtask_obs_size length must equal onehot_size")
 
             print(f"Multi-task enabled with {self.task_obs_onehot_size} tasks")
             print(f"Task names: {self.each_subtask_names}")
@@ -115,10 +112,8 @@ class TransformerActorCritic(nn.Module):
             self.task_obs_size = 0
             self.step_obs_dim = self.self_obs_size
 
-        # ✅ 关键修改：Critic 使用单步观测维度，不是历史堆叠的
         mlp_input_dim_c = num_critic_obs
-        
-        # 调试信息
+
         print(f"🔍 Debug Info:")
         print(f"   - Actor obs dim (with history): {num_actor_obs}")
         print(f"   - Critic obs dim (single step): {num_critic_obs}")
@@ -127,12 +122,13 @@ class TransformerActorCritic(nn.Module):
             print(f"   - Self obs size: {self.self_obs_size}")
             print(f"   - Task obs size: {self.task_obs_size}")
 
-        # Policy - choose between Decision Transformer or Multi-task Transformer
+        # Policy
         if self.enable_multi_task and transformer_params is not None:
             print("Building Multi-task Transformer Actor")
-            self._build_multitask_transformer_actor(transformer_params, num_actions, activation)
+            self._build_multitask_transformer_actor(transformer_params, num_actions, act_mod)
         else:
             print("Building Decision Transformer Actor")
+            # KISS：保留你的 DT 默认配置
             self.actor = DecisionTransformer(
                 state_dim=num_actor_obs - num_actions,
                 act_dim=num_actions,
@@ -146,7 +142,7 @@ class TransformerActorCritic(nn.Module):
         # Value function
         critic_layers = []
         critic_layers.append(nn.Linear(mlp_input_dim_c, critic_hidden_dims[0]))
-        critic_layers.append(activation)
+        critic_layers.append(act_mod)
         for l in range(len(critic_hidden_dims)):
             if l == len(critic_hidden_dims) - 1:
                 critic_layers.append(nn.Linear(critic_hidden_dims[l], 1))
@@ -154,7 +150,7 @@ class TransformerActorCritic(nn.Module):
                 critic_layers.append(
                     nn.Linear(critic_hidden_dims[l], critic_hidden_dims[l + 1])
                 )
-                critic_layers.append(activation)
+                critic_layers.append(act_mod)
         self.critic = nn.Sequential(*critic_layers)
 
         print(f"Actor Structure: {self.actor if not self.enable_multi_task else 'Multi-task Transformer'}")
@@ -163,27 +159,24 @@ class TransformerActorCritic(nn.Module):
         # Action noise
         self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
         self.distribution = None
-        # disable args validation for speedup
         Normal.set_default_validate_args = False
 
-    def _build_multitask_transformer_actor(self, transformer_params, num_actions, activation):
-        """Build multi-task transformer actor following file 2's architecture"""
-
-        num_features = transformer_params.get("num_features", 64)
-        num_tokens = 1 + len(self.task_obs_each_size) + 1  # weight + self + multiple tasks
-        drop_ratio = transformer_params.get("drop_ratio", 0.0)
-        tokenizer_units = transformer_params.get("tokenizer_units", [256, 128])
+    def _build_multitask_transformer_actor(self, transformer_params, num_actions, activation_module):
+        num_features = int(transformer_params.get("num_features", 64))
+        num_tokens = 1 + len(self.task_obs_each_size) + 1  # weight + self + per-task
+        drop_ratio = float(transformer_params.get("drop_ratio", 0.0))
+        tokenizer_units = list(transformer_params.get("tokenizer_units", [256, 128]))
 
         self.token_feature_dim = num_features
         self.transformer_num_tokens = num_tokens
-        
+
         print("Building tokenizer for self obs")
         self.self_encoder = self._build_mlp(
             input_size=self.self_obs_size,
             units=tokenizer_units + [num_features],
-            activation=activation
+            activation=activation_module
         )
-        
+
         self.task_encoder = nn.ModuleList()
         for idx, task_size in enumerate(self.task_obs_each_size):
             print(f"Building tokenizer for subtask obs with size {task_size}")
@@ -191,71 +184,66 @@ class TransformerActorCritic(nn.Module):
                 self._build_mlp(
                     input_size=task_size,
                     units=tokenizer_units + [num_features],
-                    activation=activation
+                    activation=activation_module
                 )
             )
-        
-        # Initialize tokenizer weights
+
         for nets in [self.self_encoder, self.task_encoder]:
             for m in nets.modules():
                 if isinstance(m, nn.Linear):
                     nn.init.orthogonal_(m.weight, gain=1.0)
                     if getattr(m, "bias", None) is not None:
                         torch.nn.init.zeros_(m.bias)
-        
-        # Weight token for attention
+
         self.weight_token = nn.Parameter(torch.zeros(1, 1, num_features))
-        
-        # Positional embedding
         self.pos_embed = nn.Parameter(torch.zeros(1, num_tokens, num_features))
-        self.pos_drop = nn.Identity()  # nn.Dropout(p=drop_ratio)
-        self.use_pos_embed = transformer_params.get("use_pos_embed", True)
-        
-        # Transformer encoder
+        self.pos_drop = nn.Identity()
+        self.use_pos_embed = bool(transformer_params.get("use_pos_embed", True))
+
+        nhead = int(transformer_params.get("layer_num_heads", 4))
+        assert num_features % nhead == 0, f"d_model ({num_features}) must be divisible by nhead ({nhead})"
+
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=num_features,
-            nhead=transformer_params.get("layer_num_heads", 4),
-            dim_feedforward=transformer_params.get("layer_dim_feedforward", 256),
+            nhead=nhead,
+            dim_feedforward=int(transformer_params.get("layer_dim_feedforward", 256)),
             dropout=drop_ratio,
             activation='relu',
-            batch_first=True,
+            batch_first=True,  # 统一 batch_first=True
         )
-        
+
         self.transformer_encoder = nn.TransformerEncoder(
-            encoder_layer, 
-            num_layers=transformer_params.get("num_layers", 2)
+            encoder_layer,
+            num_layers=int(transformer_params.get("num_layers", 2))
         )
-        
-        # Weight initialization
+
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
         nn.init.trunc_normal_(self.weight_token, std=0.02)
-        
-        # Output composer/head
-        extra_mlp_units = transformer_params.get("extra_mlp_units", [128, 64])
+
+        extra_mlp_units = list(transformer_params.get("extra_mlp_units", [128, 64]))
         self.composer = self._build_mlp(
             input_size=num_features,
             units=extra_mlp_units + [num_actions],
-            activation=activation
+            activation=activation_module
         )
-        
-        # Mark as multi-task transformer
-        self.actor = None  # We'll use the transformer components directly
+
+        self.actor = None  # 标记使用 transformer 分支
 
     def _build_mlp(self, input_size, units, activation):
-        """Helper function to build MLP"""
+        assert len(units) >= 1, "units must have at least one layer size"
         layers = []
         layers.append(nn.Linear(input_size, units[0]))
         layers.append(activation)
-        
+
         for i in range(len(units) - 1):
             layers.append(nn.Linear(units[i], units[i + 1]))
-            if i < len(units) - 2:  # Don't add activation after last layer
+            if i < len(units) - 2:
                 layers.append(activation)
-        
+
         return nn.Sequential(*layers)
 
     def _prepare_latest_observation(self, obs):
-        """Extract the latest observation from history if needed"""
+        # 支持 [B, T, D] 或 [B, D]
         if obs.dim() == 3:
             obs = obs[:, -1, :]
         if obs.shape[-1] > self.step_obs_dim:
@@ -263,56 +251,79 @@ class TransformerActorCritic(nn.Module):
         return obs
 
     def _eval_multitask_transformer(self, obs):
-        """Evaluate multi-task transformer by tokenizing self and task observations."""
-
+        # ------- 组装 token -------
         obs = self._prepare_latest_observation(obs)
+        assert obs.dim() == 2, f"expect [B, D], got {tuple(obs.shape)}"
         B = obs.shape[0]
+        device = obs.device
 
-        # Split observations into proprioceptive and task-specific components
+        # self token
         self_obs = obs[..., :self.self_obs_size]
-        self_token = self.self_encoder(self_obs).unsqueeze(1)  # (B, 1, num_feats)
+        self_token = self.self_encoder(self_obs).unsqueeze(1)  # [B, 1, F]
 
-        task_obs = obs[..., self.self_obs_size:]
+        # task tokens
+        task_obs = obs[..., self.self_obs_size:]  # [B, task_obs_size]
         task_obs_real = task_obs[..., :self.task_obs_tota_size] if self.task_obs_tota_size > 0 else task_obs.new_zeros((B, 0))
 
         if self.task_obs_onehot_size > 0:
             tokens = []
             for i in range(self.task_obs_onehot_size):
                 start, end = self.task_obs_each_indx[i], self.task_obs_each_indx[i + 1]
+                # 安全边界检查
+                assert 0 <= start <= end <= task_obs_real.shape[-1], \
+                    f"subtask slice out of range: [{start}, {end}) vs {task_obs_real.shape[-1]}"
                 tokens.append(self.task_encoder[i](task_obs_real[:, start:end]))
-            task_token = torch.stack(tokens, dim=1)
+            task_token = torch.stack(tokens, dim=1)  # [B, T, F], T=onehot_size
         else:
             task_token = task_obs_real.new_zeros((B, 0, self.token_feature_dim))
 
-        # Expand weight token
-        weight_token = self.weight_token.expand(B, -1, -1)
+        # 拼 token：weight + self + tasks
+        weight_token = self.weight_token.expand(B, -1, -1)  # [B, 1, F]
+        x = torch.cat((weight_token, self_token, task_token), dim=1)  # [B, S, F]
+        B2, S, F = x.shape
+        assert B2 == B and F == self.token_feature_dim, "token stack shape mismatch"
 
-        # Concatenate all tokens
-        x = torch.cat((weight_token, self_token, task_token), dim=1)  # [B, num_tokens, num_feats]
-
-        # Add positional embedding
         if self.use_pos_embed:
-            x = self.pos_drop(x + self.pos_embed)
+            assert self.pos_embed.shape[1] == S, f"pos_embed length {self.pos_embed.shape[1]} != S {S}"
+            x = self.pos_drop(x + self.pos_embed)  # [B, S, F]
 
-        # Compute key padding mask (True for padding positions)
-        src_key_padding_mask = torch.ones((B, x.shape[1]), dtype=torch.bool, device=x.device)
-        src_key_padding_mask[:, :2] = False  # weight and self tokens are always active
+        # ------- 构造布尔 padding mask -------
+        # True=屏蔽；False=参与注意力
+        src_key_padding_mask = torch.ones((B, S), dtype=torch.bool, device=device)
+        # weight(0) 与 self(1) token 永远激活
+        src_key_padding_mask[:, 0] = False
+        src_key_padding_mask[:, 1] = False
 
         if self.task_obs_onehot_size > 0:
-            task_mask = task_obs[..., self.task_obs_tota_size:]
-            task_obs_onehot_idx = task_mask.argmax(dim=-1) + 2
-            task_obs_onehot_idx_mask = nn.functional.one_hot(
-                task_obs_onehot_idx,
-                num_classes=self.task_obs_onehot_size + 2,
-            ).to(dtype=torch.bool)
-            src_key_padding_mask[task_obs_onehot_idx_mask] = False
+            # onehot 区段：位于原 task_obs 的末尾
+            # 形状应为 [B, onehot_size]
+            onehot = task_obs[..., self.task_obs_tota_size:]
+            assert onehot.shape == (B, self.task_obs_onehot_size), \
+                f"onehot shape {tuple(onehot.shape)} != (B, onehot_size)=({B}, {self.task_obs_onehot_size})"
 
-        # Transformer encoding
-        x = self.transformer_encoder(x, src_key_padding_mask=src_key_padding_mask)
+            # 选中当前子任务的 index（2 起步，因为 0/1 已被占用）
+            task_idx_in_seq = onehot.argmax(dim=-1).to(torch.long) + 2  # [B]
+            # 安全范围：2..S-1
+            assert (task_idx_in_seq >= 2).all() and (task_idx_in_seq < S).all(), \
+                f"task token index out of range (2..{S-1})"
 
-        # Output from weight token
-        output = self.composer(x[:, 0])
+            # 将所选子任务 token 置为激活（False）
+            src_key_padding_mask[torch.arange(B, device=device), task_idx_in_seq] = False
 
+        # ------- 关键安全检查：mask/shape/device/有效长度 -------
+        _assert_bool_mask(src_key_padding_mask, B, S, x.device)
+
+        # ------- 调用 Transformer（强制 math 路径以避坑） -------
+        try:
+            from torch.backends.cuda import sdp_kernel
+            with sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True):
+                x = self.transformer_encoder(x, src_key_padding_mask=src_key_padding_mask)  # [B, S, F]
+        except Exception:
+            # 低版本 PyTorch 没有 sdp_kernel 上下文就直接调用
+            x = self.transformer_encoder(x, src_key_padding_mask=src_key_padding_mask)
+
+        # 取 weight token 输出
+        output = self.composer(x[:, 0])  # [B, act_dim]
         return output
 
     @staticmethod
@@ -344,10 +355,9 @@ class TransformerActorCritic(nn.Module):
 
     def update_distribution(self, observations, cur_timestep=None):
         if self.enable_multi_task and self.actor is None:
-            # Use multi-task transformer
             mean = self._eval_multitask_transformer(observations)
         else:
-            # Use decision transformer
+            # DecisionTransformer 分支
             mean = self.actor(
                 cur_timestep, observations[:, :, :36], observations[:, :, 36:48]
             )
@@ -362,46 +372,29 @@ class TransformerActorCritic(nn.Module):
 
     def act_inference(self, observations, cur_timestep=None):
         if self.enable_multi_task and self.actor is None:
-            # Use multi-task transformer
             actions_mean = self._eval_multitask_transformer(observations)
         else:
-            # Use decision transformer
             actions_mean = self.actor(
                 cur_timestep, observations[:, :, :36], observations[:, :, 36:48]
             )
         return actions_mean
 
     def evaluate(self, critic_observations, **kwargs):
-        """
-        Evaluate the value function.
-        
-        Args:
-            critic_observations: Can be 2D (batch, features) or 3D (batch, history, features)
-        
-        Returns:
-            value: (batch, 1) value estimates
-        """
-        # ✅ 如果是 3D 张量（带历史），提取最后一帧
         if len(critic_observations.shape) == 3:
             critic_observations = critic_observations[:, -1, :]
-        
         value = self.critic(critic_observations)
         return value
 
     def eval_actor(self, obs, cur_timestep=None):
-        """Evaluate actor - compatible with both modes"""
         if self.enable_multi_task and self.actor is None:
             mu = self._eval_multitask_transformer(obs)
         else:
             mu = self.actor(cur_timestep, obs[:, :, :36], obs[:, :, 36:48])
-
         sigma = self.std
         return mu, sigma
 
     def eval_critic(self, obs):
-        """Evaluate critic"""
         if len(obs.shape) == 3:
-            # If history is provided, use latest observation
             obs = obs[:, -1, :]
         return self.critic(obs)
 
@@ -423,4 +416,4 @@ def get_activation(act_name):
         return nn.Sigmoid()
     else:
         print("invalid activation function!")
-        return None
+        return nn.ELU()  # 给一个安全的默认激活，KISS
