@@ -28,13 +28,9 @@
 #
 # Copyright (c) 2021 ETH Zurich, Nikita Rudin
 
-import numpy as np
-
 import torch
 import torch.nn as nn
 from torch.distributions import Normal
-from torch.nn.modules import rnn
-from transformer_modelling import DecisionTransformer
 
 
 class TransformerActorCritic(nn.Module):
@@ -117,20 +113,16 @@ class TransformerActorCritic(nn.Module):
 
         mlp_input_dim_c = self.obs_dim
 
-        # Policy - choose between Decision Transformer or Multi-task Transformer
+        # Policy - choose between Multi-task Transformer or default MLP actor
         if self.enable_multi_task and transformer_params is not None:
             print("Building Multi-task Transformer Actor")
             self._build_multitask_transformer_actor(transformer_params, num_actions, activation)
         else:
-            print("Building Decision Transformer Actor")
-            self.actor = DecisionTransformer(
-                state_dim=num_actor_obs - num_actions,
-                act_dim=num_actions,
-                n_blocks=1,
-                h_dim=64,
-                context_len=self.long_history_length,
-                n_heads=4,
-                drop_p=0.1,
+            print("Building default MLP actor")
+            self.actor = self._build_mlp(
+                input_size=num_actor_obs,
+                units=actor_hidden_dims + [num_actions],
+                activation=activation,
             )
 
         # Value function
@@ -147,7 +139,8 @@ class TransformerActorCritic(nn.Module):
                 critic_layers.append(activation)
         self.critic = nn.Sequential(*critic_layers)
 
-        print(f"Actor Structure: {self.actor if not self.enable_multi_task else 'Multi-task Transformer'}")
+        actor_structure = self.actor if not self.enable_multi_task else "Multi-task Transformer"
+        print(f"Actor Structure: {actor_structure}")
         print(f"Critic MLP: {self.critic}")
 
         # Action noise
@@ -304,6 +297,10 @@ class TransformerActorCritic(nn.Module):
 
         return output
 
+    def _eval_default_actor(self, obs):
+        obs = self._prepare_latest_observation(obs)
+        return self.actor(obs)
+
     @staticmethod
     def init_weights(sequential, scales):
         [
@@ -336,10 +333,8 @@ class TransformerActorCritic(nn.Module):
             # Use multi-task transformer
             mean = self._eval_multitask_transformer(observations)
         else:
-            # Use decision transformer
-            mean = self.actor(
-                cur_timestep, observations[:, :, :36], observations[:, :, 36:48]
-            )
+            # Use default MLP actor
+            mean = self._eval_default_actor(observations)
         self.distribution = Normal(mean, mean * 0.0 + self.std)
 
     def act(self, observations, cur_timestep=None, **kwargs):
@@ -354,10 +349,8 @@ class TransformerActorCritic(nn.Module):
             # Use multi-task transformer
             actions_mean = self._eval_multitask_transformer(observations)
         else:
-            # Use decision transformer
-            actions_mean = self.actor(
-                cur_timestep, observations[:, :, :36], observations[:, :, 36:48]
-            )
+            # Use default MLP actor
+            actions_mean = self._eval_default_actor(observations)
         return actions_mean
 
     def evaluate(self, critic_observations, **kwargs):
@@ -369,7 +362,7 @@ class TransformerActorCritic(nn.Module):
         if self.enable_multi_task and self.actor is None:
             mu = self._eval_multitask_transformer(obs)
         else:
-            mu = self.actor(cur_timestep, obs[:, :, :36], obs[:, :, 36:48])
+            mu = self._eval_default_actor(obs)
 
         sigma = self.std
         return mu, sigma

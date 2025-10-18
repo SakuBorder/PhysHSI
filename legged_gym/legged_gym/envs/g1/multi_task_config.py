@@ -275,6 +275,18 @@ class G1MultiTaskCfg(LeggedRobotCfg):
             name = "traj_marker"
         disable_gravity = True
 
+    class noise(LeggedRobotCfg.noise):
+        add_noise = True
+        noise_level = 1.0
+
+        class noise_scales(LeggedRobotCfg.noise.noise_scales):
+            ang_vel = 0.3
+            gravity = 0.05
+            dof_pos = 0.02
+            dof_vel = 2.0
+            end_effector = 0.05
+            lin_vel = 0.1
+
     class domain_rand(LeggedRobotCfg.domain_rand):
         use_random = False
         randomize_actuation_offset = use_random
