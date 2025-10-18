@@ -68,12 +68,26 @@ class HIMOnPolicyRunner:
         self.num_critic_obs = num_critic_obs
         self.actor_history_length = self.env.actor_history_length
         actor_critic_class = eval(self.cfg["policy_class_name"]) # ActorCritic
-        actor_critic: ActorCritic = actor_critic_class( 
-                                                        self.num_actor_obs,
-                                                        self.num_critic_obs,
-                                                        self.actor_history_length,
-                                                        self.env.num_actions,
-                                                        **self.policy_cfg).to(self.device)
+
+        policy_cfg = dict(self.policy_cfg)
+        if (
+            self.cfg.get("policy_class_name") == "TransformerActorCritic"
+            and hasattr(self.env, "get_multi_task_info")
+        ):
+            policy_cfg["multi_task_info"] = self.env.get_multi_task_info()
+            policy_cfg["self_obs_size"] = getattr(self.env, "num_one_step_proprio_obs", self.num_actor_obs)
+            policy_cfg["task_obs_size"] = getattr(self.env, "num_task_obs", 0)
+            policy_cfg.setdefault("transformer_params", None)
+
+        self.policy_cfg = policy_cfg
+
+        actor_critic: ActorCritic = actor_critic_class(
+            self.num_actor_obs,
+            self.num_critic_obs,
+            self.actor_history_length,
+            self.env.num_actions,
+            **policy_cfg,
+        ).to(self.device)
 
         self.amp_cfg = train_cfg["amp"]
         amp = AMP(self.amp_cfg['num_obs'], self.amp_cfg['amp_coef'], device=self.device).to(self.device)
