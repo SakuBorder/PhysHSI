@@ -65,7 +65,8 @@ class G1MultiTaskCfg(LeggedRobotCfg):
         sharp_turn_angle = 1.57
         fail_dist = 4.0
         
-        skill = ["loco_traj"]
+        # ✅ 修改：只使用 YAML 中存在的技能
+        skill = ["loco"]
         skill_init_prob = [1.0]
 
     class multi_task:
@@ -84,6 +85,7 @@ class G1MultiTaskCfg(LeggedRobotCfg):
             height_range = [0.35, 0.55]
             facing_noise = 0.3
             
+            # ✅ 修改：使用正确的技能名称
             skill = ["sitDown", "loco"]
             skill_init_prob = [0.3, 0.7]
 
@@ -92,14 +94,16 @@ class G1MultiTaskCfg(LeggedRobotCfg):
             goal_distance_range = [1.0, 2.5]
             height = 0.5
             
-            skill = ["pickUp", "carryWith", "putDown", "loco_carry"]
-            skill_init_prob = [0.2, 0.2, 0.2, 0.4]
+            # ✅ 修改：只使用 YAML 中存在的技能
+            skill = ["pickUp", "carryWith", "putDown", "loco"]
+            skill_init_prob = [0.25, 0.25, 0.25, 0.25]
 
         class standup:
             target_height = 0.95
             up_tolerance = 0.2
             
-            skill = ["standUp", "loco"]
+            # ✅ 修改：使用正确的技能名称（standup 小写）
+            skill = ["standup", "loco"]
             skill_init_prob = [0.3, 0.7]
 
     class rewards(LeggedRobotCfg.rewards):
@@ -279,14 +283,16 @@ class G1MultiTaskCfg(LeggedRobotCfg):
         reset_mode = 'hybrid'
         hybrid_init_prob = 0.5
         
-        skill = ['loco', 'loco_traj', 'loco_carry', 'sitDown', 'pickUp', 'carryWith', 'putDown', 'standUp']
-        skill_init_prob = [0.2, 0.1, 0.1, 0.15, 0.1, 0.1, 0.1, 0.15]
+        # ✅ 修改：只使用 YAML 中存在的技能
+        skill = ['loco', 'sitDown', 'pickUp', 'carryWith', 'putDown', 'standup']
+        skill_init_prob = [0.3, 0.15, 0.15, 0.15, 0.1, 0.15]
 
     class marker:
         class asset:
             file = "{LEGGED_GYM_ROOT_DIR}/resources/objects/location_marker.urdf"
             name = "traj_marker"
         disable_gravity = True
+        height_offset = 0.05
 
     class noise(LeggedRobotCfg.noise):
         add_noise = True
@@ -299,6 +305,15 @@ class G1MultiTaskCfg(LeggedRobotCfg):
             dof_vel = 2.0
             end_effector = 0.05
             lin_vel = 0.1
+
+    class normalization:
+        class obs_scales:
+            ang_vel = 0.25
+            dof_pos = 1.0
+            dof_vel = 0.05
+            lin_vel = 2.0
+        clip_observations = 100.
+        clip_actions = 100.
 
     class dataset:
         motion_file = "{LEGGED_GYM_ROOT_DIR}/resources/config/multi_task.yaml"
@@ -327,10 +342,71 @@ class G1MultiTaskCfg(LeggedRobotCfg):
         randomize_link_mass = use_random
         link_mass_range = [0.9, 1.1]
         randomize_friction = use_random
+        friction_range = [0.1, 1.5]
+        randomize_restitution = use_random
+        restitution_range = [0.0, 1.0]
+        randomize_kp = use_random
+        kp_range = [0.9, 1.1]
+        randomize_kd = use_random
+        kd_range = [0.9, 1.1]
+        randomize_initial_joint_pos = use_random
+        initial_joint_pos_scale = [1.0, 1.0]
+        initial_joint_pos_offset = [-0.1, 0.1]
+        disturbance = use_random
+        disturbance_interval = 8
+        disturbance_range = [-50, 50]
+        delay = use_random
+        max_delay_timesteps = 5
+        push_robots = False
+        push_interval_s = 10
+        max_push_vel_xy = 0.1
+
+    class viewer:
+        ref_env = 0
+        pos = [10, -5, 4]
+        lookat = [11., 3, 2.]
+
+    class sim:
+        dt = 0.005
+        substeps = 1
+        gravity = [0., 0., -9.81]
+        up_axis = 1
+
+        class physx:
+            num_threads = 10
+            solver_type = 1
+            num_position_iterations = 8
+            num_velocity_iterations = 0
+            contact_offset = 0.01
+            rest_offset = 0.0
+            bounce_threshold_velocity = 0.5
+            max_depenetration_velocity = 1.0
+            max_gpu_contact_pairs = 2**24
+            default_buffer_size_multiplier = 5
+            contact_collection = 2
 
 
 class G1MultiTaskCfgPPO(LeggedRobotCfgPPO):
+    class algorithm(LeggedRobotCfgPPO.algorithm):
+        entropy_coef = 0.01
+        value_loss_coef = 1.0
+        use_clipped_value_loss = True
+        clip_param = 0.2
+        num_learning_epochs = 5
+        num_mini_batches = 4
+        learning_rate = 1.e-3
+        schedule = 'adaptive'
+        gamma = 0.99
+        lam = 0.95
+        desired_kl = 0.01
+        max_grad_norm = 1.0
+        
     class policy(LeggedRobotCfgPPO.policy):
+        init_noise_std = 1.0
+        actor_hidden_dims = [512, 256, 128]
+        critic_hidden_dims = [512, 256, 128]
+        activation = 'elu'
+        
         transformer_params = {
             "num_features": 128,
             "tokenizer_units": [256, 128],
@@ -344,3 +420,20 @@ class G1MultiTaskCfgPPO(LeggedRobotCfgPPO):
 
     class runner(LeggedRobotCfgPPO.runner):
         policy_class_name = 'TransformerActorCritic'
+        algorithm_class_name = 'HIMPPO'
+        num_steps_per_env = 100
+        max_iterations = 20000
+        use_muon_optim = False
+        
+        save_interval = 500
+        run_name = 'multitask'
+        experiment_name = 'amp_multitask'
+        logger = 'tensorboard'
+        wandb_project = 'amp_multitask'
+        wandb_entity = 'YOUR_ENTITY_NAME'
+        
+        resume = False
+        resume_path = None
+    
+    # ✅ 关键：引用 G1MultiTaskCfg 中的 amp 配置
+    amp = G1MultiTaskCfg.amp

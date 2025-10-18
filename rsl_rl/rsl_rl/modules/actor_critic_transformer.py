@@ -115,7 +115,17 @@ class TransformerActorCritic(nn.Module):
             self.task_obs_size = 0
             self.step_obs_dim = self.self_obs_size
 
-        mlp_input_dim_c = self.obs_dim
+        # ✅ 关键修改：Critic 使用单步观测维度，不是历史堆叠的
+        mlp_input_dim_c = num_critic_obs
+        
+        # 调试信息
+        print(f"🔍 Debug Info:")
+        print(f"   - Actor obs dim (with history): {num_actor_obs}")
+        print(f"   - Critic obs dim (single step): {num_critic_obs}")
+        print(f"   - Critic input dimension: {mlp_input_dim_c}")
+        if self.enable_multi_task:
+            print(f"   - Self obs size: {self.self_obs_size}")
+            print(f"   - Task obs size: {self.task_obs_size}")
 
         # Policy - choose between Decision Transformer or Multi-task Transformer
         if self.enable_multi_task and transformer_params is not None:
@@ -245,6 +255,7 @@ class TransformerActorCritic(nn.Module):
         return nn.Sequential(*layers)
 
     def _prepare_latest_observation(self, obs):
+        """Extract the latest observation from history if needed"""
         if obs.dim() == 3:
             obs = obs[:, -1, :]
         if obs.shape[-1] > self.step_obs_dim:
@@ -361,6 +372,19 @@ class TransformerActorCritic(nn.Module):
         return actions_mean
 
     def evaluate(self, critic_observations, **kwargs):
+        """
+        Evaluate the value function.
+        
+        Args:
+            critic_observations: Can be 2D (batch, features) or 3D (batch, history, features)
+        
+        Returns:
+            value: (batch, 1) value estimates
+        """
+        # ✅ 如果是 3D 张量（带历史），提取最后一帧
+        if len(critic_observations.shape) == 3:
+            critic_observations = critic_observations[:, -1, :]
+        
         value = self.critic(critic_observations)
         return value
 

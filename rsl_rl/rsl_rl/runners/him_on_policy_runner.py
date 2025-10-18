@@ -39,11 +39,9 @@ import torch
 
 import rsl_rl
 from rsl_rl.algorithms import HIMPPO
-from rsl_rl.modules import ActorCritic
+from rsl_rl.modules import ActorCritic, TransformerActorCritic, AMP
 from rsl_rl.env import VecEnv
 from rsl_rl.utils import store_code_state
-
-from rsl_rl.modules import AMP
 from rsl_rl.utils.utils import Normalizer, AmpNormalizer
 
 class HIMOnPolicyRunner:
@@ -67,13 +65,55 @@ class HIMOnPolicyRunner:
         self.num_actor_obs = self.env.num_obs
         self.num_critic_obs = num_critic_obs
         self.actor_history_length = self.env.actor_history_length
-        actor_critic_class = eval(self.cfg["policy_class_name"]) # ActorCritic
+        
+        # 创建 policy 类映射字典（更安全的动态加载方式）
+        policy_class_map = {
+            'ActorCritic': ActorCritic,
+            'TransformerActorCritic': TransformerActorCritic
+        }
+        
+        # 安全地获取 policy 类
+        policy_class_name = self.cfg["policy_class_name"]
+        if policy_class_name not in policy_class_map:
+            raise ValueError(
+                f"Unknown policy class: {policy_class_name}. "
+                f"Available classes: {list(policy_class_map.keys())}"
+            )
+        
+        actor_critic_class = policy_class_map[policy_class_name]
+        
+        # 为 TransformerActorCritic 添加额外的参数
+        actor_critic_kwargs = {
+            **self.policy_cfg,
+            "device": self.device
+        }
+        
+        # 如果使用 TransformerActorCritic，添加多任务相关参数
+        if policy_class_name == 'TransformerActorCritic':
+            # 从环境获取多任务信息
+            if hasattr(self.env, 'get_multi_task_info'):
+                multi_task_info = self.env.get_multi_task_info()
+                actor_critic_kwargs['multi_task_info'] = multi_task_info
+                
+                # 计算任务观测和本体观测的维度
+                if hasattr(self.env, 'num_one_step_proprio_obs'):
+                    actor_critic_kwargs['self_obs_size'] = self.env.num_one_step_proprio_obs
+                if hasattr(self.env, 'num_task_obs'):
+                    actor_critic_kwargs['task_obs_size'] = self.env.num_task_obs
+                    
+                print(f"✅ Multi-task info loaded for TransformerActorCritic")
+                print(f"   - Self obs size: {actor_critic_kwargs.get('self_obs_size', 'N/A')}")
+                print(f"   - Task obs size: {actor_critic_kwargs.get('task_obs_size', 'N/A')}")
+                print(f"   - Number of tasks: {multi_task_info.get('onehot_size', 'N/A')}")
+        
+        # 创建 actor_critic 实例
         actor_critic: ActorCritic = actor_critic_class( 
-                                                        self.num_actor_obs,
-                                                        self.num_critic_obs,
-                                                        self.actor_history_length,
-                                                        self.env.num_actions,
-                                                        **self.policy_cfg).to(self.device)
+            self.num_actor_obs,
+            self.num_critic_obs,
+            self.actor_history_length,
+            self.env.num_actions,
+            **actor_critic_kwargs
+        ).to(self.device)
 
         self.amp_cfg = train_cfg["amp"]
         amp = AMP(self.amp_cfg['num_obs'], self.amp_cfg['amp_coef'], device=self.device).to(self.device)
@@ -82,13 +122,28 @@ class HIMOnPolicyRunner:
         else:
             amp_normalizer = None
 
-        alg_class = eval(self.cfg["algorithm_class_name"]) # HIMPPO
-        self.alg: HIMPPO = alg_class(actor_critic,  amp=amp, amp_normalizer=amp_normalizer, motion_buffer=self.env.motionlib, use_muon_optim=self.cfg["use_muon_optim"], device=self.device, **self.alg_cfg)
+        alg_class = HIMPPO
+        self.alg: HIMPPO = alg_class(
+            actor_critic,  
+            amp=amp, 
+            amp_normalizer=amp_normalizer, 
+            motion_buffer=self.env.motionlib, 
+            use_muon_optim=self.cfg["use_muon_optim"], 
+            device=self.device, 
+            **self.alg_cfg
+        )
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
         self.save_interval = self.cfg["save_interval"]
 
         # init storage and model
-        self.alg.init_storage(self.env.num_envs, self.num_steps_per_env, [self.env.num_obs], [self.env.num_privileged_obs], [self.env.num_actions],  [self.env.num_amp_obs])
+        self.alg.init_storage(
+            self.env.num_envs, 
+            self.num_steps_per_env, 
+            [self.env.num_obs], 
+            [self.env.num_privileged_obs], 
+            [self.env.num_actions],  
+            [self.env.num_amp_obs]
+        )
 
         # Log
         self.log_dir = log_dir
@@ -117,7 +172,10 @@ class HIMOnPolicyRunner:
                 raise AssertionError("logger type not found")
             
         if init_at_random_ep_len:
-            self.env.episode_length_buf = torch.randint_like(self.env.episode_length_buf, high=int(self.env.max_episode_length))
+            self.env.episode_length_buf = torch.randint_like(
+                self.env.episode_length_buf, 
+                high=int(self.env.max_episode_length)
+            )
         obs = self.env.get_observations()
         privileged_obs = self.env.get_privileged_observations()
         critic_obs = privileged_obs if privileged_obs is not None else obs
@@ -227,10 +285,6 @@ class HIMOnPolicyRunner:
 
         self.writer.add_scalar('Loss/value_function', locs['mean_value_loss'], locs['it'])
         self.writer.add_scalar('Loss/surrogate', locs['mean_surrogate_loss'], locs['it'])
-        # self.writer.add_scalar('Loss/Kld Loss', locs['mean_kld_loss'], locs['it'])
-        # self.writer.add_scalar('Loss/Swap Loss', locs['mean_swap_loss'], locs['it'])
-        # self.writer.add_scalar('Loss/Actor Sym Loss', locs['mean_actor_sym_loss'], locs['it'])
-        # self.writer.add_scalar('Loss/Critic Sym Loss', locs['mean_critic_sym_loss'], locs['it'])
         self.writer.add_scalar('Loss/learning_rate', self.alg.learning_rate, locs['it'])
         self.writer.add_scalar('Loss/amp_loss', locs['amp_loss'], locs['it'])
         self.writer.add_scalar('Loss/amp_expert_loss', locs['expert_loss'], locs['it'])
@@ -239,7 +293,7 @@ class HIMOnPolicyRunner:
         self.writer.add_scalar('Perf/total_fps', fps, locs['it'])
         self.writer.add_scalar('Perf/collection time', locs['collection_time'], locs['it'])
         self.writer.add_scalar('Perf/learning_time', locs['learn_time'], locs['it'])
-        # self.writer.add_scalar('Perf/motionbuffer_size', locs['currentlength'], locs['it'])
+        
         if len(locs['rewbuffer']) > 0:
             self.writer.add_scalar('Train/mean_reward', statistics.mean(locs['rewbuffer']), locs['it'])
             self.writer.add_scalar('Train/mean_raw_reward', statistics.mean(locs['raw_rewbuffer']), locs['it'])
@@ -258,15 +312,9 @@ class HIMOnPolicyRunner:
                             'collection_time']:.3f}s, learning {locs['learn_time']:.3f}s)\n"""
                           f"""{'Value function loss:':>{pad}} {locs['mean_value_loss']:.4f}\n"""
                           f"""{'Surrogate loss:':>{pad}} {locs['mean_surrogate_loss']:.4f}\n"""
-                        #   f"""{'Kld Loss:':>{pad}} {locs['mean_kld_loss']:.4f}\n"""
-                        #   f"""{'Swap loss:':>{pad}} {locs['mean_swap_loss']:.4f}\n"""
-                        #   f"""{'Mean actor sym loss:':>{pad}} {locs['mean_actor_sym_loss']:.4f}\n"""
-                        #   f"""{'Mean critic sym loss:':>{pad}} {locs['mean_critic_sym_loss']:.4f}\n"""
                           f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n"""
                           f"""{'Mean reward:':>{pad}} {statistics.mean(locs['rewbuffer']):.2f}\n"""
                           f"""{'Mean episode length:':>{pad}} {statistics.mean(locs['lenbuffer']):.2f}\n""")
-                        #   f"""{'Mean reward/step:':>{pad}} {locs['mean_reward']:.2f}\n"""
-                        #   f"""{'Mean episode length/episode:':>{pad}} {locs['mean_trajectory_length']:.2f}\n""")
         else:
             log_string = (f"""{'#' * width}\n"""
                           f"""{str.center(width, ' ')}\n\n"""
@@ -274,13 +322,7 @@ class HIMOnPolicyRunner:
                             'collection_time']:.3f}s, learning {locs['learn_time']:.3f}s)\n"""
                           f"""{'Value function loss:':>{pad}} {locs['mean_value_loss']:.4f}\n"""
                           f"""{'Surrogate loss:':>{pad}} {locs['mean_surrogate_loss']:.4f}\n"""
-                        #   f"""{'Kld Loss:':>{pad}} {locs['mean_kld_loss']:.4f}\n"""
-                        #   f"""{'Swap loss:':>{pad}} {locs['mean_swap_loss']:.4f}\n"""
-                        #   f"""{'Mean actor sym loss:':>{pad}} {locs['mean_actor_sym_loss']:.4f}\n"""
-                        #   f"""{'Mean critic sym loss:':>{pad}} {locs['mean_critic_sym_loss']:.4f}\n"""
                           f"""{'Mean action noise std:':>{pad}} {mean_std.item():.2f}\n""")
-                        #   f"""{'Mean reward/step:':>{pad}} {locs['mean_reward']:.2f}\n"""
-                        #   f"""{'Mean episode length/episode:':>{pad}} {locs['mean_trajectory_length']:.2f}\n""")
 
         log_string += ep_string
         log_string += (f"""{'-' * width}\n"""
@@ -291,8 +333,6 @@ class HIMOnPolicyRunner:
                                locs['num_learning_iterations'] - locs['it']):.1f}s\n""")
         print(log_string)
 
-
-        
     def save(self, path, infos=None):
         torch.save({
             'model_state_dict': self.alg.actor_critic.state_dict(),
@@ -319,30 +359,3 @@ class HIMOnPolicyRunner:
         if device is not None:
             self.alg.actor_critic.to(device)
         return self.alg.actor_critic.act_inference
-    
-    # def get_estcritic_policy(self, device=None):
-    #     self.alg.actor_critic.eval() # switch to evaluation mode (dropout for example)
-    #     if device is not None:
-    #         self.alg.actor_critic.to(device)
-    #     return self.alg.actor_critic.estevaluate
-
-    
-    # def get_critic_policy(self, device = None):
-    #     if device is not None:
-    #         self.alg.actor_critic.to(device)
-    #     return self.alg.actor_critic.evaluate
-
-    # def train_mode(self):
-    #     self.alg.actor_critic.train()
-    #     if self.empirical_normalization:
-    #         self.obs_normalizer.train()
-    #         self.critic_obs_normalizer.train()
-
-    # def eval_mode(self):
-    #     self.alg.actor_critic.eval()
-    #     if self.empirical_normalization:
-    #         self.obs_normalizer.eval()
-    #         self.critic_obs_normalizer.eval()
-
-    # def add_git_repo_to_log(self, repo_file_path):
-    #     self.git_status_repos.append(repo_file_path)
