@@ -294,6 +294,21 @@ class G1MultiTaskCfg(LeggedRobotCfg):
         disable_gravity = True
         height_offset = 0.05
 
+    class visuals:
+        class sitdown:
+            seat_size = [0.35, 0.35, 0.02]
+            color = [0.25, 0.45, 0.85]
+
+        class carrybox:
+            box_size = [0.35, 0.35, 0.35]
+            box_color = [0.85, 0.55, 0.2]
+            goal_size = [0.45, 0.45, 0.02]
+            goal_color = [0.2, 0.8, 0.3]
+
+        class standup:
+            marker_radius = 0.12
+            color = [0.9, 0.25, 0.25]
+
     class noise(LeggedRobotCfg.noise):
         add_noise = True
         noise_level = 1.0
