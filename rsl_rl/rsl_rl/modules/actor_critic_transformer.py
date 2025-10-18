@@ -295,8 +295,8 @@ class TransformerActorCritic(nn.Module):
             x = self.pos_drop(x + self.pos_embed)
 
         # Compute key padding mask (True for padding positions)
-        src_key_padding_mask = torch.ones((B, x.shape[1]), dtype=torch.bool, device=x.device)
-        src_key_padding_mask[:, :2] = False  # weight and self tokens are always active
+        padding_mask = torch.ones((B, x.shape[1]), dtype=torch.bool, device=x.device)
+        padding_mask[:, :2] = False  # weight and self tokens are always active
 
         if self.task_obs_onehot_size > 0:
             task_mask = task_obs[..., self.task_obs_tota_size:]
@@ -305,7 +305,17 @@ class TransformerActorCritic(nn.Module):
                 task_obs_onehot_idx,
                 num_classes=self.task_obs_onehot_size + 2,
             ).to(dtype=torch.bool)
-            src_key_padding_mask[task_obs_onehot_idx_mask] = False
+            padding_mask[task_obs_onehot_idx_mask] = False
+
+        # Torch 2.3's scaled_dot_product_attention kernel on CUDA expects a float mask
+        # with `-inf` entries for the padded positions. Using a boolean mask triggers an
+        # "invalid configuration argument" launch error. To keep CPU execution fast we
+        # only convert to the float mask on CUDA.
+        if x.is_cuda:
+            src_key_padding_mask = padding_mask.float()
+            src_key_padding_mask.masked_fill_(padding_mask, float("-inf"))
+        else:
+            src_key_padding_mask = padding_mask
 
         # Transformer encoding
         x = self.transformer_encoder(x, src_key_padding_mask=src_key_padding_mask)
