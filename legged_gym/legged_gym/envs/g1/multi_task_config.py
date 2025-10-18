@@ -291,4 +291,18 @@ class G1MultiTaskCfg(LeggedRobotCfg):
 
 
 class G1MultiTaskCfgPPO(LeggedRobotCfgPPO):
-    pass
+    class policy(LeggedRobotCfgPPO.policy):
+        # Transformer-specific hyper-parameters mirroring TokenHSI defaults
+        transformer_params = {
+            "num_features": 128,
+            "tokenizer_units": [256, 128],
+            "drop_ratio": 0.1,
+            "layer_num_heads": 4,
+            "layer_dim_feedforward": 256,
+            "num_layers": 2,
+            "extra_mlp_units": [128, 64],
+            "use_pos_embed": True,
+        }
+
+    class runner(LeggedRobotCfgPPO.runner):
+        policy_class_name = 'TransformerActorCritic'
