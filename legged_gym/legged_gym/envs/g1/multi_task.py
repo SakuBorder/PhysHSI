@@ -131,6 +131,7 @@ class LeggedRobot(BaseTask):
 
         # —— 新增：marker 高度偏移（默认 0.0，可在 cfg.marker.height_offset 配置）——
         self._marker_height_offset = float(getattr(getattr(self.cfg, "marker", object()), "height_offset", 0.0))
+        self._hidden_marker_height = float(getattr(getattr(self.cfg, "marker", object()), "hidden_height", -10.0))
 
         # 每个 env 的常数 marker z（在 _create_envs 中写入）
         self._marker_z0 = None  # torch.tensor(num_envs, device=self.device) after _create_envs
@@ -814,7 +815,7 @@ class LeggedRobot(BaseTask):
 
         # z 使用固定常数：每个 env 独立的 marker_z0
         marker_z = self._marker_z0[env_ids]
-        quat_identity = torch.tensor([0, 0, 0, 1], dtype=torch.float, device=self.device).view(1, 1, 4)
+        quat_identity = self._identity_quat.view(1, 1, 4)
 
         sample_start = self._traj_marker_start
         sample_end = sample_start + self._num_traj_samples
@@ -827,7 +828,7 @@ class LeggedRobot(BaseTask):
         tgt = self._traj_curr_target[env_ids].clone()
         ars[env_ids, target_slot, 0:2] = tgt[:, 0:2]
         ars[env_ids, target_slot, 2] = marker_z
-        ars[env_ids, target_slot, 3:7] = quat_identity.view(1, 4).repeat(len(env_ids), 1)
+        ars[env_ids, target_slot, 3:7] = self._identity_quat.view(1, 4).repeat(len(env_ids), 1)
         ars[env_ids, target_slot, 7:13] = 0.0
 
         # 简化：整体写回
@@ -853,6 +854,8 @@ class LeggedRobot(BaseTask):
                 self._reset_carry_targets(task_env_ids)
             elif name == "standup":
                 self._reset_stand_targets(task_env_ids)
+
+        self._sync_task_visual_states(env_ids)
 
         self.gym.set_actor_root_state_tensor(self.sim, gymtorch.unwrap_tensor(self.all_root_states.reshape(-1, 13)))
 
@@ -922,15 +925,14 @@ class LeggedRobot(BaseTask):
             ars[env_ids, self._carry_box_slot, 3:7] = self._carry_box_rot[env_ids]
             ars[env_ids, self._carry_box_slot, 7:13] = 0.0
         if self._carry_goal_slot is not None:
-            identity = torch.tensor([0, 0, 0, 1], dtype=torch.float, device=self.device)
             ars[env_ids, self._carry_goal_slot, 0:3] = self._carry_box_goal[env_ids]
-            ars[env_ids, self._carry_goal_slot, 3:7] = identity.view(1, 4).repeat(len(env_ids), 1)
+            ars[env_ids, self._carry_goal_slot, 3:7] = self._identity_quat.view(1, 4).repeat(len(env_ids), 1)
             ars[env_ids, self._carry_goal_slot, 7:13] = 0.0
 
     def _reset_stand_targets(self, env_ids):
         if env_ids.numel() == 0:
             return
-        
+
         # 设置目标高度
         self._stand_target_height[env_ids, 0] = float(self._stand_cfg.target_height)
         
@@ -955,10 +957,100 @@ class LeggedRobot(BaseTask):
         if self._stand_marker_slot is not None:
             ars = self.all_root_states.view(self.num_envs, self.num_actors_per_env, 13)
             slot = self._stand_marker_slot
-            identity = torch.tensor([0, 0, 0, 1], dtype=torch.float, device=self.device)
             ars[env_ids, slot, 0:3] = self._stand_marker_pos[env_ids]
-            ars[env_ids, slot, 3:7] = identity.view(1, 4).repeat(len(env_ids), 1)
+            ars[env_ids, slot, 3:7] = self._identity_quat.view(1, 4).repeat(len(env_ids), 1)
             ars[env_ids, slot, 7:13] = 0.0
+
+    def _sync_task_visual_states(self, env_ids=None):
+        if not (self._has_sit_task or self._has_carry_task or self._has_stand_task):
+            return
+
+        if env_ids is not None and env_ids.numel() == 0:
+            return
+
+        if env_ids is None:
+            selection = torch.ones(self.num_envs, dtype=torch.bool, device=self.device)
+        else:
+            selection = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+            selection[env_ids] = True
+
+        ars = self.all_root_states.view(self.num_envs, self.num_actors_per_env, 13)
+        hidden_z = self._hidden_marker_height
+        identity = self._identity_quat
+
+        def _hidden_pose(ids):
+            if ids.numel() == 0:
+                return None
+            pos = torch.zeros((ids.numel(), 3), device=self.device, dtype=self.root_states.dtype)
+            pos[:, 0:2] = self.env_origins[ids, 0:2]
+            pos[:, 2] = hidden_z
+            return pos
+
+        if self._has_sit_task and self._sit_marker_slot is not None:
+            sit_idx = self.task_name_to_id.get("sitdown")
+            if sit_idx is not None:
+                active_mask = selection & (self.task_indicator == sit_idx)
+                inactive_mask = selection & ~(self.task_indicator == sit_idx)
+
+                if torch.any(active_mask):
+                    ids = torch.nonzero(active_mask, as_tuple=False).flatten()
+                    ars[ids, self._sit_marker_slot, 0:3] = self._sit_target_pos[ids]
+                    ars[ids, self._sit_marker_slot, 3:7] = self._sit_target_quat[ids]
+                    ars[ids, self._sit_marker_slot, 7:13] = 0.0
+
+                if torch.any(inactive_mask):
+                    ids = torch.nonzero(inactive_mask, as_tuple=False).flatten()
+                    pos = _hidden_pose(ids)
+                    if pos is not None:
+                        ars[ids, self._sit_marker_slot, 0:3] = pos
+                        ars[ids, self._sit_marker_slot, 3:7] = identity.view(1, 4).repeat(ids.numel(), 1)
+                        ars[ids, self._sit_marker_slot, 7:13] = 0.0
+
+        if self._has_carry_task and self._carry_box_slot is not None and self._carry_goal_slot is not None:
+            carry_idx = self.task_name_to_id.get("carrybox")
+            if carry_idx is not None:
+                active_mask = selection & (self.task_indicator == carry_idx)
+                inactive_mask = selection & ~(self.task_indicator == carry_idx)
+
+                if torch.any(active_mask):
+                    ids = torch.nonzero(active_mask, as_tuple=False).flatten()
+                    ars[ids, self._carry_box_slot, 0:3] = self._carry_box_pos[ids]
+                    ars[ids, self._carry_box_slot, 3:7] = self._carry_box_rot[ids]
+                    ars[ids, self._carry_box_slot, 7:13] = 0.0
+                    ars[ids, self._carry_goal_slot, 0:3] = self._carry_box_goal[ids]
+                    ars[ids, self._carry_goal_slot, 3:7] = identity.view(1, 4).repeat(ids.numel(), 1)
+                    ars[ids, self._carry_goal_slot, 7:13] = 0.0
+
+                if torch.any(inactive_mask):
+                    ids = torch.nonzero(inactive_mask, as_tuple=False).flatten()
+                    pos = _hidden_pose(ids)
+                    if pos is not None:
+                        ars[ids, self._carry_box_slot, 0:3] = pos
+                        ars[ids, self._carry_box_slot, 3:7] = identity.view(1, 4).repeat(ids.numel(), 1)
+                        ars[ids, self._carry_box_slot, 7:13] = 0.0
+                        ars[ids, self._carry_goal_slot, 0:3] = pos
+                        ars[ids, self._carry_goal_slot, 3:7] = identity.view(1, 4).repeat(ids.numel(), 1)
+                        ars[ids, self._carry_goal_slot, 7:13] = 0.0
+
+        if self._has_stand_task and self._stand_marker_slot is not None:
+            stand_idx = self.task_name_to_id.get("standup")
+            if stand_idx is not None:
+                active_mask = selection & (self.task_indicator == stand_idx)
+                inactive_mask = selection & ~(self.task_indicator == stand_idx)
+
+                if torch.any(active_mask):
+                    ids = torch.nonzero(active_mask, as_tuple=False).flatten()
+                    ars[ids, self._stand_marker_slot, 0:3] = self._stand_marker_pos[ids]
+                    ars[ids, self._stand_marker_slot, 3:7] = identity.view(1, 4).repeat(ids.numel(), 1)
+                    ars[ids, self._stand_marker_slot, 7:13] = 0.0
+
+                if torch.any(inactive_mask):
+                    ids = torch.nonzero(inactive_mask, as_tuple=False).flatten()
+                    pos = _hidden_pose(ids)
+                    if pos is not None:
+                        ars[ids, self._stand_marker_slot, 0:3] = pos
+                        ars[ids, self._stand_marker_slot, 3:7] = identity.view(1, 4).repeat(ids.numel(), 1)
+                        ars[ids, self._stand_marker_slot, 7:13] = 0.0
 
     def _compute_sit_obs(self):
         delta = self._sit_target_pos - self.root_states[:, 0:3]
@@ -987,18 +1079,43 @@ class LeggedRobot(BaseTask):
         ars = self.all_root_states.view(self.num_envs, self.num_actors_per_env, 13)
 
         # x,y 来自轨迹；z 始终固定为每个 env 的 marker_z0
-        zcol = self._marker_z0.view(self.num_envs, 1)  # (N,1)
-
-        # 批量更新采样点
         sample_start = self._traj_marker_start
         sample_end = sample_start + S
-        ars[:, sample_start:sample_end, 0:2] = self._traj_samples_buf[:, :, 0:2]
-        ars[:, sample_start:sample_end, 2] = zcol.expand(-1, S)
-
-        # 更新目标点
         target_slot = self._traj_target_slot
-        ars[:, target_slot, 0:2] = self._traj_curr_target[:, 0:2]
-        ars[:, target_slot, 2] = self._marker_z0
+        traj_idx = self.task_name_to_id.get("traj")
+
+        if traj_idx is None:
+            return
+
+        active_mask = self.task_indicator == traj_idx
+        inactive_mask = ~active_mask
+
+        if torch.any(active_mask):
+            ids = torch.nonzero(active_mask, as_tuple=False).flatten()
+            zcol = self._marker_z0[ids].unsqueeze(-1)
+            ars[ids, sample_start:sample_end, 0:2] = self._traj_samples_buf[ids, :, 0:2]
+            ars[ids, sample_start:sample_end, 2] = zcol.expand(-1, S)
+            ars[ids, sample_start:sample_end, 3:7] = self._identity_quat.view(1, 1, 4).repeat(ids.numel(), S, 1)
+            ars[ids, sample_start:sample_end, 7:13] = 0.0
+
+            ars[ids, target_slot, 0:2] = self._traj_curr_target[ids, 0:2]
+            ars[ids, target_slot, 2] = self._marker_z0[ids]
+            ars[ids, target_slot, 3:7] = self._identity_quat.view(1, 4).repeat(ids.numel(), 1)
+            ars[ids, target_slot, 7:13] = 0.0
+
+        if torch.any(inactive_mask):
+            ids = torch.nonzero(inactive_mask, as_tuple=False).flatten()
+            if ids.numel() > 0:
+                base_xy = self.env_origins[ids, 0:2].unsqueeze(1).expand(-1, S, -1)
+                ars[ids, sample_start:sample_end, 0:2] = base_xy
+                ars[ids, sample_start:sample_end, 2] = self._hidden_marker_height
+                ars[ids, sample_start:sample_end, 3:7] = self._identity_quat.view(1, 1, 4).repeat(ids.numel(), S, 1)
+                ars[ids, sample_start:sample_end, 7:13] = 0.0
+
+                ars[ids, target_slot, 0:2] = self.env_origins[ids, 0:2]
+                ars[ids, target_slot, 2] = self._hidden_marker_height
+                ars[ids, target_slot, 3:7] = self._identity_quat.view(1, 4).repeat(ids.numel(), 1)
+                ars[ids, target_slot, 7:13] = 0.0
 
         # 一次性写回
         self.gym.set_actor_root_state_tensor(self.sim, gymtorch.unwrap_tensor(self.all_root_states.reshape(-1, 13)))
@@ -1092,6 +1209,8 @@ class LeggedRobot(BaseTask):
         # ========== 通用状态 ==========
         self.common_step_counter = 0
         self.extras = {}
+
+        self._identity_quat = torch.tensor([0.0, 0.0, 0.0, 1.0], device=self.device)
         
         # Skill相关
         self.skill = self.cfg.asset.skill
