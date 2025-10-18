@@ -826,7 +826,12 @@ class LeggedRobot(BaseTask):
         self._sit_target_pos[env_ids, 2:3] = target_z
 
         facing_angle = torch.atan2(-offsets_xy[:, 1], -offsets_xy[:, 0])
-        facing_angle += torch_rand_float(-float(cfg.facing_noise), float(cfg.facing_noise), (env_ids.numel(),), device=self.device)
+        facing_angle += torch_rand_float(
+            -float(cfg.facing_noise),
+            float(cfg.facing_noise),
+            (env_ids.numel(), 1),
+            device=self.device,
+        ).squeeze(-1)
         self._sit_target_facing[env_ids, 0] = torch.cos(facing_angle)
         self._sit_target_facing[env_ids, 1] = torch.sin(facing_angle)
         self._sit_target_height[env_ids, 0] = target_z.squeeze(-1)
@@ -862,8 +867,8 @@ class LeggedRobot(BaseTask):
             return
         self._stand_target_height[env_ids, 0] = float(self._stand_cfg.target_height)
         marker_offset = torch.zeros((env_ids.numel(), 2), device=self.device)
-        marker_offset[:, 0] = torch_rand_float(0.8, 1.5, (env_ids.numel(),), device=self.device)
-        marker_offset[:, 1] = torch_rand_float(-0.5, 0.5, (env_ids.numel(),), device=self.device)
+        marker_offset[:, 0] = torch_rand_float(0.8, 1.5, (env_ids.numel(), 1), device=self.device).squeeze(-1)
+        marker_offset[:, 1] = torch_rand_float(-0.5, 0.5, (env_ids.numel(), 1), device=self.device).squeeze(-1)
         self._stand_marker_pos[env_ids, 0:2] = self.root_states[env_ids, 0:2] + marker_offset
         self._stand_marker_pos[env_ids, 2] = self._stand_target_height[env_ids, 0]
 
