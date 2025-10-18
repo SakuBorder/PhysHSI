@@ -32,6 +32,7 @@ import time
 import os
 from collections import deque
 import statistics
+from importlib import import_module
 
 from torch.utils.tensorboard import SummaryWriter as TensorboardSummaryWriter
 
@@ -85,7 +86,11 @@ class HIMOnPolicyRunner:
                 self.policy_cfg["task_obs_size"] = int(self.env.num_task_obs)
             self.policy_cfg["multi_task_info"] = multi_task_info
 
-        actor_critic_class = eval(self.cfg["policy_class_name"]) # ActorCritic
+        actor_module = import_module("rsl_rl.modules")
+        try:
+            actor_critic_class = getattr(actor_module, self.cfg["policy_class_name"])
+        except AttributeError as exc:
+            raise ValueError(f"Unknown policy_class_name: {self.cfg['policy_class_name']}") from exc
         actor_critic: ActorCritic = actor_critic_class(
                                                         self.num_actor_obs,
                                                         self.num_critic_obs,
@@ -100,7 +105,11 @@ class HIMOnPolicyRunner:
         else:
             amp_normalizer = None
 
-        alg_class = eval(self.cfg["algorithm_class_name"]) # HIMPPO
+        alg_module = import_module("rsl_rl.algorithms")
+        try:
+            alg_class = getattr(alg_module, self.cfg["algorithm_class_name"])
+        except AttributeError as exc:
+            raise ValueError(f"Unknown algorithm_class_name: {self.cfg['algorithm_class_name']}") from exc
         self.alg: HIMPPO = alg_class(actor_critic,  amp=amp, amp_normalizer=amp_normalizer, motion_buffer=self.env.motionlib, use_muon_optim=self.cfg["use_muon_optim"], device=self.device, **self.alg_cfg)
         self.num_steps_per_env = self.cfg["num_steps_per_env"]
         self.save_interval = self.cfg["save_interval"]
