@@ -287,6 +287,20 @@ class G1MultiTaskCfg(LeggedRobotCfg):
             end_effector = 0.05
             lin_vel = 0.1
 
+    class dataset:
+        motion_file = "{LEGGED_GYM_ROOT_DIR}/resources/config/loco.yaml"
+        joint_mapping_file = "{LEGGED_GYM_ROOT_DIR}/resources/config/joint_id.txt"
+        frame_rate = 60
+        min_time = 0.1  # [s]
+
+    class amp:
+        amp_coef = 0.3
+        num_one_step_obs = 1 + 29 + 5 * 3 + 3 + 3 + 6
+        window_length = 10
+        num_obs = num_one_step_obs * window_length
+        ratio_random_range = [0.9, 1.1]
+        use_normalizer = False
+
     class domain_rand(LeggedRobotCfg.domain_rand):
         use_random = False
         randomize_actuation_offset = use_random
