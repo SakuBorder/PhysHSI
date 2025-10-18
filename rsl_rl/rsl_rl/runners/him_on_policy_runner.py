@@ -67,8 +67,26 @@ class HIMOnPolicyRunner:
         self.num_actor_obs = self.env.num_obs
         self.num_critic_obs = num_critic_obs
         self.actor_history_length = self.env.actor_history_length
+        # Inject multi-task metadata into the policy config when available.
+        multi_task_info = None
+        if hasattr(self.env, "get_multi_task_info"):
+            try:
+                multi_task_info = self.env.get_multi_task_info()
+            except TypeError:
+                # Some environments expose the method but require arguments; ignore them.
+                multi_task_info = None
+
+        if multi_task_info is not None and multi_task_info.get("enable_task_mask_obs", False):
+            # Explicitly provide observation splits so the transformer can build
+            # task-specific tokens just like in TokenHSI.
+            if hasattr(self.env, "num_one_step_proprio_obs"):
+                self.policy_cfg["self_obs_size"] = int(self.env.num_one_step_proprio_obs)
+            if hasattr(self.env, "num_task_obs"):
+                self.policy_cfg["task_obs_size"] = int(self.env.num_task_obs)
+            self.policy_cfg["multi_task_info"] = multi_task_info
+
         actor_critic_class = eval(self.cfg["policy_class_name"]) # ActorCritic
-        actor_critic: ActorCritic = actor_critic_class( 
+        actor_critic: ActorCritic = actor_critic_class(
                                                         self.num_actor_obs,
                                                         self.num_critic_obs,
                                                         self.actor_history_length,
