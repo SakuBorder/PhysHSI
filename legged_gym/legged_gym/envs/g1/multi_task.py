@@ -57,7 +57,7 @@ class LeggedRobot(BaseTask):
         self.init_done = False
         self._parse_cfg(self.cfg)
 
-        # 先读取本体观测相关（不含任务观测）
+        # 读取本体观测相关（不含任务观测）
         self.num_one_step_proprio_obs = self.cfg.env.num_one_step_proprio_obs
         self.actor_history_length = self.cfg.env.num_actor_history
         self.actor_obs_length = self.cfg.env.num_actor_obs
@@ -76,6 +76,7 @@ class LeggedRobot(BaseTask):
             self._traj_fail_dist = float(self.cfg.traj.fail_dist)
             self._traj_num_verts = int(self.cfg.traj.num_vertices)
             self._traj_dtheta_max = float(self.cfg.traj.dtheta_max)
+        
         self.multi_task_cfg = getattr(self.cfg, "multi_task", None)
         assert self.multi_task_cfg is not None, "multi_task config required"
         self.task_names = list(self.multi_task_cfg.task_names)
@@ -91,9 +92,9 @@ class LeggedRobot(BaseTask):
             total_task_obs_dim += self.num_tasks
         assert (
             self.num_task_obs == total_task_obs_dim
-        ), "num_task_obs must match declared task observation dimensions and mask settings"
+        ), f"num_task_obs ({self.num_task_obs}) must match declared task observation dimensions and mask settings ({total_task_obs_dim})"
 
-        # 单步 actor 观测 = 本体 + 任务
+        # 修正：明确单步 actor 观测 = 本体 + 任务
         self.num_one_step_actor_obs = self.num_one_step_proprio_obs + self.num_task_obs
 
         self._sit_cfg = getattr(self.multi_task_cfg, "sitdown")
@@ -405,43 +406,62 @@ class LeggedRobot(BaseTask):
             self.episode_sums["termination"] += rew
 
     def compute_observations(self):
-        current_obs = torch.cat((self.commands[:, :3],
-                                 self.base_ang_vel  * self.obs_scales.ang_vel,
-                                 self.projected_gravity,
-                                 (self.dof_pos - self.default_dof_pos) * self.obs_scales.dof_pos,
-                                 self.dof_vel * self.obs_scales.dof_vel,
-                                 self.end_effector_pos,
-                                 self.actions,
-                                 self.base_lin_vel * self.obs_scales.lin_vel,
-                                 ), dim=-1)
+        # 本体观测（不含lin_vel）
+        current_proprio_obs = torch.cat((
+            self.base_ang_vel * self.obs_scales.ang_vel,
+            self.projected_gravity,
+            (self.dof_pos - self.default_dof_pos) * self.obs_scales.dof_pos,
+            self.dof_vel * self.obs_scales.dof_vel,
+            self.end_effector_pos,
+            self.actions
+        ), dim=-1)
+        
+        # Critic用（含lin_vel）
+        current_obs = torch.cat((
+            current_proprio_obs,
+            self.base_lin_vel * self.obs_scales.lin_vel
+        ), dim=-1)
 
-        current_actor_obs = torch.clone(current_obs[:,:-3])
-
+        # 加噪声（只对actor的本体观测）
         if self.add_noise:
-            # 只对 actor 的本体/动作部分加噪声；任务观测不加噪声
-            current_actor_obs = current_actor_obs + (2 * torch.rand_like(current_actor_obs) - 1) * self.noise_scale_vec[0:(9 + 2 * self.num_dof + self.num_actions + 15)]
+            current_actor_obs = current_proprio_obs + \
+                (2 * torch.rand_like(current_proprio_obs) - 1) * self.noise_scale_vec
+        else:
+            current_actor_obs = current_proprio_obs
 
+        # 任务观测
         if self.enable_traj_task:
             task_obs_actor, task_obs_critic = self.compute_task_observations()
-            self.obs_buf = torch.cat((self.obs_buf[:, self.num_one_step_actor_obs:], current_actor_obs, task_obs_actor), dim=-1)
+            
+            # Actor obs: 历史堆叠
+            self.obs_buf = torch.cat((
+                self.obs_buf[:, (self.num_one_step_proprio_obs + self.num_task_obs):],
+                current_actor_obs,
+                task_obs_actor
+            ), dim=-1)
+            
+            # Critic obs: 当前
             self.privileged_obs_buf = torch.cat((current_obs, task_obs_critic), dim=-1)
         else:
-            self.obs_buf = torch.cat((self.obs_buf[:, self.num_one_step_proprio_obs:], current_actor_obs), dim=-1)
+            self.obs_buf = torch.cat((
+                self.obs_buf[:, self.num_one_step_proprio_obs:],
+                current_actor_obs
+            ), dim=-1)
             self.privileged_obs_buf = current_obs.clone()
 
         self.extras["task_mask"] = self.task_mask
         self.extras["task_uid"] = self.task_indicator
 
     def compute_termination_observations(self, env_ids):
-        current_obs = torch.cat((self.commands[:, :3],
-                                 self.base_ang_vel  * self.obs_scales.ang_vel,
-                                 self.projected_gravity,
-                                 (self.dof_pos - self.default_dof_pos) * self.obs_scales.dof_pos,
-                                 self.dof_vel * self.obs_scales.dof_vel,
-                                 self.end_effector_pos,
-                                 self.actions,
-                                 self.base_lin_vel * self.obs_scales.lin_vel,
-                                 ), dim=-1)
+        current_obs = torch.cat((
+            self.base_ang_vel * self.obs_scales.ang_vel,
+            self.projected_gravity,
+            (self.dof_pos - self.default_dof_pos) * self.obs_scales.dof_pos,
+            self.dof_vel * self.obs_scales.dof_vel,
+            self.end_effector_pos,
+            self.actions,
+            self.base_lin_vel * self.obs_scales.lin_vel
+        ), dim=-1)
 
         if self.enable_traj_task:
             _, task_obs_critic = self.compute_task_observations()
@@ -866,10 +886,25 @@ class LeggedRobot(BaseTask):
     def _reset_stand_targets(self, env_ids):
         if env_ids.numel() == 0:
             return
+        
+        # 设置目标高度
         self._stand_target_height[env_ids, 0] = float(self._stand_cfg.target_height)
+        
+        # 修正：torch_rand_float 需要 (N, 1) 的形状
         marker_offset = torch.zeros((env_ids.numel(), 2), device=self.device)
-        marker_offset[:, 0] = torch_rand_float(0.8, 1.5, (env_ids.numel(),), device=self.device)
-        marker_offset[:, 1] = torch_rand_float(-0.5, 0.5, (env_ids.numel(),), device=self.device)
+        marker_offset[:, 0] = torch_rand_float(
+            0.8, 1.5, 
+            (env_ids.numel(), 1),  # 修改：从 (env_ids.numel(),) 改为 (env_ids.numel(), 1)
+            device=self.device
+        ).squeeze(-1)  # 然后压缩最后一维
+        
+        marker_offset[:, 1] = torch_rand_float(
+            -0.5, 0.5, 
+            (env_ids.numel(), 1),  # 修改：从 (env_ids.numel(),) 改为 (env_ids.numel(), 1)
+            device=self.device
+        ).squeeze(-1)  # 然后压缩最后一维
+        
+        # 设置marker位置
         self._stand_marker_pos[env_ids, 0:2] = self.root_states[env_ids, 0:2] + marker_offset
         self._stand_marker_pos[env_ids, 2] = self._stand_target_height[env_ids, 0]
 
@@ -915,70 +950,110 @@ class LeggedRobot(BaseTask):
 
     # ---------------- Buffers ----------------
     def _get_noise_scale_vec(self, cfg):
-        noise_vec = torch.zeros(self.num_one_step_proprio_obs + 3, device=self.device)
+        """
+        修正后的噪声缩放向量：
+        - 只包含本体观测的噪声（108维）
+        - 不包含commands（actor obs不含commands）
+        - 不包含lin_vel（actor obs不含lin_vel）
+        """
+        # 噪声向量维度 = 本体观测维度 = 108
+        noise_vec = torch.zeros(self.num_one_step_proprio_obs, device=self.device)
+        
         self.add_noise = self.cfg.noise.add_noise
         noise_scales = self.cfg.noise.noise_scales
         noise_level = self.cfg.noise.noise_level
-        noise_vec[0:3] = 0.  # command
-        noise_vec[3:6] = noise_scales.ang_vel * noise_level * self.obs_scales.ang_vel
-        noise_vec[6:9] = noise_scales.gravity * noise_level
-        noise_vec[9:(9 + self.num_dof)] = noise_scales.dof_pos * noise_level * self.obs_scales.dof_pos
-        noise_vec[(9 + self.num_dof):(9 + 2 * self.num_dof)] = noise_scales.dof_vel * noise_level * self.obs_scales.dof_vel
-        noise_vec[(9 + 2 * self.num_dof):(9 + 2 * self.num_dof + 15)] = noise_scales.end_effector * noise_level
-        noise_vec[(9 + 2 * self.num_dof):(9 + 2 * self.num_dof + self.num_actions)] = 0.
-        noise_vec[(9 + 2 * self.num_dof + self.num_actions + 15):(12 + 2 * self.num_dof + self.num_actions + 15)] = 0.
+        
+        # 按顺序对应 current_proprio_obs 的各个部分
+        idx = 0
+        
+        # ang_vel (3)
+        noise_vec[idx:idx+3] = noise_scales.ang_vel * noise_level * self.obs_scales.ang_vel
+        idx += 3
+        
+        # gravity (3)
+        noise_vec[idx:idx+3] = noise_scales.gravity * noise_level
+        idx += 3
+        
+        # dof_pos (num_dofs)
+        noise_vec[idx:idx+self.num_dof] = noise_scales.dof_pos * noise_level * self.obs_scales.dof_pos
+        idx += self.num_dof
+        
+        # dof_vel (num_dofs)
+        noise_vec[idx:idx+self.num_dof] = noise_scales.dof_vel * noise_level * self.obs_scales.dof_vel
+        idx += self.num_dof
+        
+        # end_effector (15)
+        noise_vec[idx:idx+15] = noise_scales.end_effector * noise_level
+        idx += 15
+        
+        # actions (num_actions) - 不加噪声
+        noise_vec[idx:idx+self.num_actions] = 0.0
+        idx += self.num_actions
+        
+        assert idx == self.num_one_step_proprio_obs, \
+            f"Noise vector size mismatch: {idx} vs {self.num_one_step_proprio_obs}"
+        
         return noise_vec
 
     def _init_buffers(self):
-        # 获取 gym GPU 张量
+        """初始化所有张量缓冲区"""
+        
+        # ========== 获取 gym GPU 张量 ==========
         actor_root_state = self.gym.acquire_actor_root_state_tensor(self.sim)
         dof_state_tensor = self.gym.acquire_dof_state_tensor(self.sim)
         net_contact_forces = self.gym.acquire_net_contact_force_tensor(self.sim)
         rigid_body_state = self.gym.acquire_rigid_body_state_tensor(self.sim)
         self._refresh_sim_tensors()
 
-        # root states（按 actor 组织）
+        # ========== Root states（按 actor 组织）==========
         self.all_root_states = gymtorch.wrap_tensor(actor_root_state)
         assert self.all_root_states.numel() == self.num_envs * self.num_actors_per_env * 13
         ars = self.all_root_states.view(self.num_envs, self.num_actors_per_env, 13)
         self.root_states = ars[:, 0, :]  # 机器人在槽位 0
 
-        # rigid bodies（只保留机器人刚体段）
+        # ========== Rigid bodies（只保留机器人刚体段）==========
         full_rb = gymtorch.wrap_tensor(rigid_body_state).view(self.num_envs, self.total_bodies_per_env, 13)
         self.rigid_body_states = full_rb[:, :self.num_bodies, :]
 
-        # dof / contact
+        # ========== DOF states ==========
         self.dof_state = gymtorch.wrap_tensor(dof_state_tensor)
         dv = self.dof_state.view(self.num_envs, self.num_dof, 2)
         self.dof_pos = dv[..., 0]
         self.dof_vel = dv[..., 1]
+
+        # ========== Contact forces ==========
         full_cf = gymtorch.wrap_tensor(net_contact_forces).view(self.num_envs, self.total_bodies_per_env, 3)
         self.contact_forces = full_cf[:, :self.num_bodies, :]
 
-        # 常用缓存
+        # ========== 常用缓存 ==========
         self.base_quat = self.root_states[:, 3:7]
-        self.feet_pos  = self.rigid_body_states[:, self.feet_indices, 0:3]
+        self.feet_pos = self.rigid_body_states[:, self.feet_indices, 0:3]
         self.feet_quat = self.rigid_body_states[:, self.feet_indices, 3:7]
-        self.feet_vel  = self.rigid_body_states[:, self.feet_indices, 7:10]
-        self.left_feet_pos  = self.rigid_body_states[:, self.left_feet_indices, 0:3]
+        self.feet_vel = self.rigid_body_states[:, self.feet_indices, 7:10]
+        self.left_feet_pos = self.rigid_body_states[:, self.left_feet_indices, 0:3]
         self.right_feet_pos = self.rigid_body_states[:, self.right_feet_indices, 0:3]
         self.pelvis_contact_pos = self.rigid_body_states[:, self.pelvis_contact_index, :3]
 
+        # ========== 通用状态 ==========
         self.common_step_counter = 0
         self.extras = {}
+        
+        # Skill相关
         self.skill = self.cfg.asset.skill
         self.skill_init_prob = torch.tensor(self.cfg.asset.skill_init_prob, device=self.device)
 
+        # 基础向量
         self.gravity_vec = to_torch(get_axis_params(-1., self.up_axis_idx), device=self.device).repeat((self.num_envs, 1))
         self.forward_vec = to_torch([1., 0., 0.], device=self.device).repeat((self.num_envs, 1))
         self.z_axis_unit = torch.tensor([0.0, 0.0, 1.0], device=self.device).unsqueeze(0)
+
+        # ========== 控制相关 ==========
         self.torques = torch.zeros(self.num_envs, self.num_dof, device=self.device)
         self.p_gains = torch.zeros(self.num_dof, device=self.device)
         self.d_gains = torch.zeros(self.num_dof, device=self.device)
 
-        # 明确 num_actions
-        self.num_actions = getattr(self, "num_actions", self.num_dof)
-
+        # 动作
+        self.num_actions = getattr(self.cfg.env, "num_actions", self.num_dof)
         self.actions = torch.zeros(self.num_envs, self.num_actions, device=self.device)
         self.last_actions = torch.zeros_like(self.actions)
         self.last_last_actions = torch.zeros_like(self.actions)
@@ -987,35 +1062,58 @@ class LeggedRobot(BaseTask):
         self.last_torques = torch.zeros_like(self.torques)
         self.last_root_vel = torch.zeros_like(self.root_states[:, 7:13])
 
+        # ========== 命令 ==========
         self.commands = torch.zeros(self.num_envs, self.cfg.commands.num_commands, device=self.device)
+        
+        # ========== 足部接触相关 ==========
         self.feet_air_time = torch.zeros(self.num_envs, len(self.feet_indices), device=self.device)
         self.last_contacts = torch.zeros(self.num_envs, len(self.feet_indices), dtype=torch.bool, device=self.device)
         self.first_contacts = torch.zeros_like(self.last_contacts)
 
-        self.base_lin_vel = quat_rotate_inverse(self.rigid_body_states[:, self.upper_body_index,3:7], self.rigid_body_states[:, self.upper_body_index,7:10])
-        self.base_ang_vel = quat_rotate_inverse(self.rigid_body_states[:, self.upper_body_index,3:7], self.rigid_body_states[:, self.upper_body_index,10:13])
-        self.projected_gravity = quat_rotate_inverse(self.rigid_body_states[:, self.upper_body_index,3:7], self.gravity_vec)
+        # ========== 速度和重力 ==========
+        self.base_lin_vel = quat_rotate_inverse(
+            self.rigid_body_states[:, self.upper_body_index, 3:7],
+            self.rigid_body_states[:, self.upper_body_index, 7:10]
+        )
+        self.base_ang_vel = quat_rotate_inverse(
+            self.rigid_body_states[:, self.upper_body_index, 3:7],
+            self.rigid_body_states[:, self.upper_body_index, 10:13]
+        )
+        self.projected_gravity = quat_rotate_inverse(
+            self.rigid_body_states[:, self.upper_body_index, 3:7],
+            self.gravity_vec
+        )
 
-        self.delay_buffer = torch.zeros(self.cfg.domain_rand.max_delay_timesteps, self.num_envs, self.num_actions, device=self.device)
+        # ========== 延迟和噪声 ==========
+        self.delay_buffer = torch.zeros(
+            self.cfg.domain_rand.max_delay_timesteps,
+            self.num_envs,
+            self.num_actions,
+            device=self.device
+        )
         self.noise_scale_vec = self._get_noise_scale_vec(self.cfg)
 
+        # ========== 末端执行器位置 ==========
         self.end_effector_pos = torch.cat((
             self.rigid_body_states[:, self.hand_pos_indices[0], :3],
             self.rigid_body_states[:, self.hand_pos_indices[1], :3],
-            self.feet_pos[:, 0], self.feet_pos[:, 1],
+            self.feet_pos[:, 0],
+            self.feet_pos[:, 1],
             self.rigid_body_states[:, self.head_index, :3]
         ), dim=-1)
         self.end_effector_pos = self.end_effector_pos - self.root_states[:, :3].repeat(1, 5)
         for i in range(5):
             self.end_effector_pos[:, 3*i:3*i+3] = quat_rotate_inverse(
                 self.rigid_body_states[:, self.upper_body_index, 3:7],
-                self.end_effector_pos[:, 3*i:3*i+3])
+                self.end_effector_pos[:, 3*i:3*i+3]
+            )
 
+        # ========== 轨迹任务相关 ==========
         if self.enable_traj_task:
             self.traj_obs_buf = torch.zeros(self.num_envs, self._task_obs_total_dim, device=self.device)
             self._traj_curr_target = torch.zeros(self.num_envs, 3, device=self.device)
 
-        # 默认关节与 PD
+        # ========== 默认关节位置与PD增益 ==========
         self.default_dof_pos = torch.zeros(self.num_dof, device=self.device)
         for i in range(self.num_dof):
             name = self.dof_names[i]
@@ -1026,11 +1124,14 @@ class LeggedRobot(BaseTask):
                     self.p_gains[i] = self.cfg.control.stiffness[dof_name]
                     self.d_gains[i] = self.cfg.control.damping[dof_name]
                     found = True
+                    break
             if not found and self.cfg.control.control_type in ["P", "V"]:
                 print(f"PD gain of joint {name} were not defined, setting them to zero")
+        
         self.default_dof_pos = self.default_dof_pos.unsqueeze(0)
         self.default_dof_poses = self.default_dof_pos.repeat(self.num_envs, 1)
 
+        # ========== Domain randomization 参数 ==========
         self.Kp_factors = torch.ones(self.num_envs, self.num_dof, device=self.device)
         self.Kd_factors = torch.ones_like(self.Kp_factors)
         self.actuation_offset = torch.zeros_like(self.Kp_factors)
@@ -1038,41 +1139,82 @@ class LeggedRobot(BaseTask):
         self.disturbance = torch.zeros(self.num_envs, self.num_bodies, 3, device=self.device)
         self.zero_force = torch.tensor([0.0, 0.0, 0.0], device=self.device)
 
-        # joint_powers 历史缓存（N_env, T_hist, N_dof）
+        # ========== 关节功率历史 ==========
         hist = max(int(self.actor_history_length), 1)
         self.joint_powers = torch.zeros(self.num_envs, hist, self.num_dof, device=self.device)
 
-        actor_one_step_dim = ( 3                 # commands
-                              +3                # base_ang_vel
-                              +3                # gravity
-                              +self.num_dof     # (q - q0)
-                              +self.num_dof     # dq
-                              +15               # ee pos
-                              +self.num_actions # actions
-                              +3 )              # base_lin_vel
-        if self.enable_traj_task:
-            actor_one_step_dim += self.num_task_obs
-        self.obs_buf = torch.zeros(self.num_envs, self.actor_history_length * self.num_one_step_actor_obs, device=self.device)
+        # ========== 观测缓冲区（修正后）==========
+        # Actor观测：历史堆叠 × (本体108 + 任务N)
+        actor_one_step_dim = self.num_one_step_proprio_obs + self.num_task_obs
+        self.obs_buf = torch.zeros(
+            self.num_envs,
+            self.actor_history_length * actor_one_step_dim,
+            device=self.device
+        )
 
-        # privileged obs（不堆叠）
-        priv_dim = ( 3+3+3 + self.num_dof + self.num_dof + 15 + self.num_actions + 3 )
-        if self.enable_traj_task:
-            priv_dim += self.num_task_obs
+        # Critic观测：当前 (本体108 + lin_vel3 + 任务N)
+        priv_dim = self.num_one_step_proprio_obs + 3 + self.num_task_obs
         self.privileged_obs_buf = torch.zeros(self.num_envs, priv_dim, device=self.device)
 
-        # rew_buf 显式初始化
+        # 奖励缓冲区
         self.rew_buf = torch.zeros(self.num_envs, device=self.device)
 
-        # dataset / AMP
+        # ========== Motion library 和 AMP ==========
         motion_file = self.cfg.dataset.motion_file.format(LEGGED_GYM_ROOT_DIR=LEGGED_GYM_ROOT_DIR)
         joint_mapping_file = self.cfg.dataset.joint_mapping_file.format(LEGGED_GYM_ROOT_DIR=LEGGED_GYM_ROOT_DIR)
+        
         self.motionlib = MotionLib(
-            motion_file=motion_file, mapping_file=joint_mapping_file, dof_names=self.dof_names,
-            fps=self.cfg.dataset.frame_rate, device=self.device,
-            window_length=self.cfg.amp.window_length, ratio_random_range=self.cfg.amp.ratio_random_range
+            motion_file=motion_file,
+            mapping_file=joint_mapping_file,
+            dof_names=self.dof_names,
+            fps=self.cfg.dataset.frame_rate,
+            device=self.device,
+            window_length=self.cfg.amp.window_length,
+            ratio_random_range=self.cfg.amp.ratio_random_range
         )
+        
+        # AMP观测关节索引
         amp_obs_joint_id = [i for i, n in enumerate(self.dof_names) if n in self.motionlib.mapping.keys()]
         self.amp_obs_joint_id = torch.tensor(amp_obs_joint_id, device=self.device)
+
+        # ========== 维度验证 ==========
+        if hasattr(self, 'init_done') and self.init_done:
+            self._verify_buffer_dimensions()
+
+
+    def _verify_buffer_dimensions(self):
+        """验证所有缓冲区维度是否正确"""
+        # 本体观测维度：ang_vel(3) + gravity(3) + dof_pos(29) + dof_vel(29) + ee_pos(15) + actions(29) = 108
+        expected_proprio = 6 + self.num_dof * 2 + self.num_actions + 15
+        assert self.num_one_step_proprio_obs == expected_proprio, \
+            f"❌ Proprio obs dimension mismatch: {self.num_one_step_proprio_obs} != {expected_proprio}"
+        
+        # Actor单步观测维度
+        expected_actor_one_step = self.num_one_step_proprio_obs + self.num_task_obs
+        
+        # Actor总观测维度
+        expected_actor_total = self.actor_history_length * expected_actor_one_step
+        assert self.obs_buf.shape[1] == expected_actor_total, \
+            f"❌ Actor obs buffer mismatch: {self.obs_buf.shape[1]} != {expected_actor_total}"
+        
+        # Critic观测维度
+        expected_critic = self.num_one_step_proprio_obs + 3 + self.num_task_obs
+        assert self.privileged_obs_buf.shape[1] == expected_critic, \
+            f"❌ Critic obs buffer mismatch: {self.privileged_obs_buf.shape[1]} != {expected_critic}"
+        
+        # 噪声向量维度
+        assert self.noise_scale_vec.shape[0] == self.num_one_step_proprio_obs, \
+            f"❌ Noise vector mismatch: {self.noise_scale_vec.shape[0]} != {self.num_one_step_proprio_obs}"
+        
+        print("=" * 80)
+        print("✅ 观测缓冲区维度验证通过!")
+        print(f"   - 本体观测: {self.num_one_step_proprio_obs}")
+        print(f"   - 任务观测: {self.num_task_obs}")
+        print(f"   - Actor单步: {expected_actor_one_step}")
+        print(f"   - Actor总维度: {expected_actor_total} (历史{self.actor_history_length}帧)")
+        print(f"   - Critic维度: {expected_critic}")
+        print(f"   - 噪声向量: {self.noise_scale_vec.shape[0]}")
+        print("=" * 80)
 
     # ---------------- Rewards plumbing ----------------
     def _prepare_reward_function(self):

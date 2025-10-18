@@ -10,9 +10,9 @@ class G1MultiTaskCfg(LeggedRobotCfg):
 
         enable_task_mask_obs = True
 
-        num_one_step_proprio_obs = 3 + 6 + num_dofs * 2 + num_actions + 3 * 5
+        # 修正：本体观测 = ang_vel(3) + gravity(3) + dof_pos(29) + dof_vel(29) + ee_pos(15) + actions(29) = 108
+        num_one_step_proprio_obs = 6 + num_dofs * 2 + num_actions + 3 * 5
 
-        # 每个任务的观测长度：轨迹(20) + 坐下(6) + 搬箱(9) + 起立(5) + 任务mask(4)
         task_obs_dim_map = {
             "traj": 2 * 10,
             "sitdown": 6,
@@ -24,6 +24,7 @@ class G1MultiTaskCfg(LeggedRobotCfg):
         num_actor_history = 6
         num_actor_obs = num_actor_history * (num_one_step_proprio_obs + num_task_obs)
 
+        # 修正：critic obs = 本体(108) + lin_vel(3) + 任务
         num_privileged_obs = num_one_step_proprio_obs + 3 + num_task_obs
 
         env_spacing = 10.
@@ -63,6 +64,9 @@ class G1MultiTaskCfg(LeggedRobotCfg):
         sharp_turn_prob = 0.15
         sharp_turn_angle = 1.57
         fail_dist = 4.0
+        
+        skill = ["loco_traj"]
+        skill_init_prob = [1.0]
 
     class multi_task:
         task_names = ["traj", "sitdown", "carrybox", "standup"]
@@ -79,15 +83,24 @@ class G1MultiTaskCfg(LeggedRobotCfg):
             lateral_noise = 1.0
             height_range = [0.35, 0.55]
             facing_noise = 0.3
+            
+            skill = ["sitDown", "loco"]
+            skill_init_prob = [0.3, 0.7]
 
         class carrybox:
             start_distance_range = [0.6, 1.8]
             goal_distance_range = [1.0, 2.5]
             height = 0.5
+            
+            skill = ["pickUp", "carryWith", "putDown", "loco_carry"]
+            skill_init_prob = [0.2, 0.2, 0.2, 0.4]
 
         class standup:
             target_height = 0.95
             up_tolerance = 0.2
+            
+            skill = ["standUp", "loco"]
+            skill_init_prob = [0.3, 0.7]
 
     class rewards(LeggedRobotCfg.rewards):
         class scales(LeggedRobotCfg.rewards.scales):
@@ -106,7 +119,6 @@ class G1MultiTaskCfg(LeggedRobotCfg):
             relocation_task = 1.0
             standup_task = 3.0
 
-        # sitdown
         robot2chair_vel = 1.0
         loco_heading = 1.0
         sit_pos_far = 1.0
@@ -116,7 +128,6 @@ class G1MultiTaskCfg(LeggedRobotCfg):
         target_speed_loco = 0.85
         thresh_robot2chair = 0.7
 
-        # carrybox
         robot2object_pos = 0.0
         robot2object_vel = 1.0
         start_heading = 0.5
@@ -135,7 +146,6 @@ class G1MultiTaskCfg(LeggedRobotCfg):
         thresh_object2goal = 0.05
         thresh_object2start = 0.5
 
-        # standup
         base_height = 0.0
         head_height = 0.5
         stand_still = 1.0
@@ -213,9 +223,10 @@ class G1MultiTaskCfg(LeggedRobotCfg):
         }
         action_scale = 0.25
         decimation = 4
-        curriculum_joints = ['waist_yaw_joint', 'left_shoulder_roll_joint', 'left_shoulder_yaw_joint', 'left_shoulder_pitch_joint',
-                              'left_elbow_joint', 'left_wrist_roll_joint', 'right_shoulder_roll_joint', 'right_shoulder_yaw_joint',
-                              'right_shoulder_pitch_joint', 'right_elbow_joint', 'right_wrist_roll_joint']
+        curriculum_joints = ['waist_yaw_joint', 'left_shoulder_roll_joint', 'left_shoulder_yaw_joint', 
+                             'left_shoulder_pitch_joint', 'left_elbow_joint', 'left_wrist_roll_joint', 
+                             'right_shoulder_roll_joint', 'right_shoulder_yaw_joint',
+                             'right_shoulder_pitch_joint', 'right_elbow_joint', 'right_wrist_roll_joint']
         left_leg_joints = ['left_hip_yaw_joint', 'left_hip_roll_joint', 'left_hip_pitch_joint', 'left_knee_joint',
                            'left_ankle_pitch_joint', 'left_ankle_roll_joint']
         right_leg_joints = ['right_hip_yaw_joint', 'right_hip_roll_joint', 'right_hip_pitch_joint', 'right_knee_joint',
@@ -264,10 +275,12 @@ class G1MultiTaskCfg(LeggedRobotCfg):
         max_linear_velocity = 1000.
         armature = 0.01
         thickness = 0.01
+        
         reset_mode = 'hybrid'
         hybrid_init_prob = 0.5
-        skill = ['loco']
-        skill_init_prob = [1.0]
+        
+        skill = ['loco', 'loco_traj', 'loco_carry', 'sitDown', 'pickUp', 'carryWith', 'putDown', 'standUp']
+        skill_init_prob = [0.2, 0.1, 0.1, 0.15, 0.1, 0.1, 0.1, 0.15]
 
     class marker:
         class asset:
@@ -288,10 +301,10 @@ class G1MultiTaskCfg(LeggedRobotCfg):
             lin_vel = 0.1
 
     class dataset:
-        motion_file = "{LEGGED_GYM_ROOT_DIR}/resources/config/loco.yaml"
+        motion_file = "{LEGGED_GYM_ROOT_DIR}/resources/config/multi_task.yaml"
         joint_mapping_file = "{LEGGED_GYM_ROOT_DIR}/resources/config/joint_id.txt"
         frame_rate = 60
-        min_time = 0.1  # [s]
+        min_time = 0.1
 
     class amp:
         amp_coef = 0.3
@@ -318,7 +331,6 @@ class G1MultiTaskCfg(LeggedRobotCfg):
 
 class G1MultiTaskCfgPPO(LeggedRobotCfgPPO):
     class policy(LeggedRobotCfgPPO.policy):
-        # Transformer-specific hyper-parameters mirroring TokenHSI defaults
         transformer_params = {
             "num_features": 128,
             "tokenizer_units": [256, 128],

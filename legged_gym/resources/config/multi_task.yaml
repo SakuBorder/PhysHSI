@@ -1,0 +1,86 @@
+motions:
+  loco:
+    - file: ../dataset/dataset_loco/B1_-_stand_to_walk_stageii.pt
+      rsi_skipped_range: []
+      weight: 1.0
+    - file: ../dataset/dataset_loco/B2_-_walk_to_stand_stageii.pt
+      rsi_skipped_range: []
+      weight: 1.0
+    - file: ../dataset/dataset_loco/B2_-_walk_to_stand_t2_stageii.pt
+      rsi_skipped_range: []
+      weight: 1.0
+    - file: ../dataset/dataset_loco/B3_-_walk1_stageii.pt
+      rsi_skipped_range: []
+      weight: 1.0
+    - file: ../dataset/dataset_loco/B9_-_walk_turn_left_(90)_stageii.pt
+      rsi_skipped_range: []
+      weight: 1.0
+    - file: ../dataset/dataset_loco/B10_-_walk_turn_left_(45)_stageii.pt
+      rsi_skipped_range: []
+      weight: 1.0
+    - file: ../dataset/dataset_loco/B11_-_walk_turn_left_(135)_stageii.pt
+      rsi_skipped_range: []
+      weight: 1.0
+    - file: ../dataset/dataset_loco/B12_-_walk_turn_right_(90)_stageii.pt
+      rsi_skipped_range: []
+      weight: 1.0
+    - file: ../dataset/dataset_loco/B13_-_walk_turn_right_(45)_stageii.pt
+      rsi_skipped_range: []
+      weight: 1.0
+    - file: ../dataset/dataset_loco/B14_-_walk_turn_right_(135)_stageii.pt
+      rsi_skipped_range: []
+      weight: 1.0
+    - file: ../dataset/dataset_loco/B15_-_walk_turn_around_(same_direction)_stageii.pt
+      rsi_skipped_range: []
+      weight: 1.0
+
+  pickUp:
+    - file: ../dataset/dataset_carrybox/pickUp/pickup1.pt
+      rsi_skipped_range: []
+      weight: 4.0
+    - file: ../dataset/dataset_carrybox/pickUp/pickup2.pt
+      rsi_skipped_range: []
+      weight: 4.0
+    - file: ../dataset/dataset_carrybox/pickUp/pickup3.pt
+      rsi_skipped_range: []
+      weight: 4.0
+
+  putDown:
+    - file: ../dataset/dataset_carrybox/putDown/putdown1.pt
+      rsi_skipped_range: []
+      weight: 5.0
+    - file: ../dataset/dataset_carrybox/putDown/putdown2.pt
+      rsi_skipped_range: []
+      weight: 5.0
+
+  carryWith:
+    - file: ../dataset/dataset_carrybox/carryWith/carrywith1.pt
+      rsi_skipped_range: []
+      weight: 5.0
+    - file: ../dataset/dataset_carrybox/carryWith/carrywith2.pt
+      rsi_skipped_range: []
+      weight: 2.0
+    - file: ../dataset/dataset_carrybox/carryWith/carrywith3.pt
+      rsi_skipped_range: []
+      weight: 5.0
+  sitDown:
+    - file: ../dataset/dataset_sitdown/sitDown/SAMP+__+Subject+__+chair_mo003_stageII.pt
+      rsi_skipped_range: []
+      weight: 2.0
+    - file: ../dataset/dataset_sitdown/sitDown/SAMP+__+Subject+__+chair_mo006_stageII.pt
+      rsi_skipped_range: []
+      weight: 2.0
+    - file: ../dataset/dataset_sitdown/sitDown/SAMP+__+Subject+__+chair_mo010_stageII.pt
+      rsi_skipped_range: []
+      weight: 2.0
+    - file: ../dataset/dataset_sitdown/sitDown/SAMP+__+Subject+__+chair_mo016_stageII.pt
+      rsi_skipped_range: []
+      weight: 2.0
+
+  standup:
+    - file: ../dataset/dataset_standup/standUp/SAMP+__+Subject+__+armchair002_stageII.pt
+      rsi_skipped_range: [110, 10000]
+      weight: 2.0
+    - file: ../dataset/dataset_standup/standUp/SAMP+__+Subject+__+chair_mo006_stageII_reversed.pt
+      rsi_skipped_range: [140, 100000]
+      weight: 2.0
