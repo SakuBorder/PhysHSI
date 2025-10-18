@@ -134,6 +134,16 @@ To play the final trained checkpoint for any task:
 python legged_gym/scripts/play.py --task [task_name] --resume_path [ckpt_path]
 ```
 
+### PhysHSI Stage-1 multi-task helper
+
+To launch the four core PhysHSI skills (**SitDown**, **Traj**, **StandUp**, **CarryBox**) in a single transformer-driven training run—matching the TokenHSI multi-task recipe—run:
+
+```bash
+sh physhsi_amp/scripts/stage1_train.sh
+```
+
+The helper registers the PhysHSI multi-task wrapper and then reuses the TokenHSI transformer runner under the hood. All four skills share one transformer policy and discriminator, mirroring the TokenHSI workflow while keeping the datasets and assets untouched inside the PhysHSI repo.
+
 > By default, PhysHSI uses **TensorBoard** for logging training metrics.  
 > 
 > If you prefer to use **Weights & Biases (wandb)**, please enable it in the corresponding `[task_name]_config.py` file and set the appropriate `wandb_entity` for your account.
